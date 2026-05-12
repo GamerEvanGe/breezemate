@@ -45,6 +45,13 @@ class AudioCaptureError(RuntimeError):
     pass
 
 
+# Process-wide guard so two AudioCapture instances can never have
+# overlapping live recorder threads. See class docstring for the
+# crash-history rationale.
+_ACTIVE_RECORDER_LOCK = threading.Lock()
+_ACTIVE_RECORDER: "Optional[threading.Thread]" = None
+
+
 def _resolve_device(info: DeviceInfo):
     """Return the underlying soundcard ``_Microphone`` object for a DeviceInfo.
 
@@ -95,6 +102,19 @@ def _resolve_device(info: DeviceInfo):
 class AudioCapture:
     """Background-threaded audio capture producing 16 kHz mono int16 bytes.
 
+    Only one ``AudioCapture`` instance is allowed to have a live
+    recorder thread at a time *process-wide*. This is enforced by
+    ``_ACTIVE_RECORDER`` -- a class-level slot that holds a weakref
+    to the current owner. If a previous pipeline's recorder thread
+    is still alive (e.g. stuck in a slow ``recorder_cm.record()`` C
+    call) and a new pipeline tries to start, ``start()`` will raise
+    rather than opening a second WASAPI recorder on the same device.
+    That second recorder is exactly what produced the BEX64 /
+    0xc0000409 CRT fast-fail crashes we used to see on quick
+    stop/start cycles: two threads racing inside MediaFoundation
+    corrupted the heap, and ucrtbase's invariant checker tripped a
+    few seconds later.
+
     ``tee_callback`` (optional) is invoked on the recorder thread with
     every PCM chunk in addition to the chunk being pushed onto the
     asyncio queue. This is how the local Vosk preview ASR receives
@@ -128,22 +148,77 @@ class AudioCapture:
         return f"{self.device_info.source}:{self.device_info.name}"
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
-        if self._thread is not None:
-            raise RuntimeError("AudioCapture already started")
-        self._loop = loop
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run, name="rt-audio-capture", daemon=True
-        )
-        self._thread.start()
+        global _ACTIVE_RECORDER
+        with _ACTIVE_RECORDER_LOCK:
+            # Cross-instance check: is *any* recorder thread (possibly
+            # one owned by a previous AudioCapture instance whose
+            # stop() returned with a stuck record() call) still alive?
+            prev = _ACTIVE_RECORDER
+            if prev is not None and prev.is_alive():
+                raise RuntimeError(
+                    "AudioCapture: a previous recorder thread is still running. "
+                    "Wait for it to exit before starting a new capture (this "
+                    "guard prevents the WASAPI race that caused the BEX64 / "
+                    "0xc0000409 crashes)."
+                )
+            # Same-instance sanity check (mostly redundant with the
+            # process-wide one, but keeps the existing error if a
+            # caller mis-uses a single instance).
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError(
+                    "AudioCapture.start called while this instance's recorder "
+                    "thread is still alive."
+                )
+            self._thread = None
+            self._loop = loop
+            self._stop_event.clear()
+            t = threading.Thread(
+                target=self._run, name="rt-audio-capture", daemon=True
+            )
+            self._thread = t
+            _ACTIVE_RECORDER = t
+            t.start()
         log.info("Audio capture started (%s)", self.description)
 
     def stop(self) -> None:
+        """Signal the recorder thread to stop and block until it dies.
+
+        We give the recorder a generous timeout (10 s by default).
+        ``soundcard.recorder.record()`` is a blocking C call into
+        WASAPI/MediaFoundation; on most systems it returns within
+        50-100 ms once ``_stop_event`` is checked, but a stalled
+        device or a slow driver can occasionally hold it for longer.
+        If the thread STILL hasn't exited by then we deliberately
+        keep the reference alive instead of dropping it -- that
+        prevents start() from kicking off a second recorder on the
+        same WASAPI device, which would otherwise race the zombie
+        thread and corrupt the heap (CRT __fastfail in ucrtbase).
+        """
+        global _ACTIVE_RECORDER
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        t = self._thread
+        if t is None:
+            return
+        # 10 s is well above any normal Windows audio API latency.
+        # We've seen rare 2-3 s stalls in the wild; 10 s gives them
+        # plenty of headroom while still bounding shutdown time.
+        t.join(timeout=10.0)
+        with _ACTIVE_RECORDER_LOCK:
+            if t.is_alive():
+                log.error(
+                    "Audio capture thread did not exit within 10 s; keeping "
+                    "the process-wide active-recorder reference so the next "
+                    "start() refuses instead of creating a zombie. Source=%s",
+                    self.description,
+                )
+                # NB: do NOT clear self._thread or _ACTIVE_RECORDER --
+                # leaving them set is what causes the next start() to
+                # raise instead of opening a second WASAPI handle.
+                return
             self._thread = None
-            log.info("Audio capture stopped")
+            if _ACTIVE_RECORDER is t:
+                _ACTIVE_RECORDER = None
+        log.info("Audio capture stopped")
 
     def _run(self) -> None:
         com_initialised = False

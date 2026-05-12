@@ -36,6 +36,16 @@ log = logging.getLogger(__name__)
 # ``audio_capture`` produces (16 kHz mono PCM16).
 EXPECTED_SAMPLE_RATE = 16_000
 
+# Special sentinel queue payloads. The audio queue holds PCM byte
+# chunks; we reuse it as the worker thread's command channel so that
+# anything which mutates the C++ recognizer object can ONLY happen on
+# the worker thread. Crossing threads to touch the Vosk recognizer
+# (e.g. recreating it from the asyncio loop while AcceptWaveform is
+# in flight on the worker) is what produced our earlier intermittent
+# heap-corruption crashes -- this routing fixes it by construction.
+_RESET_SENTINEL = b"__VOSK_RESET__"
+_STOP_SENTINEL = None  # already used by stop(); kept as a named alias.
+
 
 class VoskLocalASR:
     """Threaded Vosk wrapper with a partial-only output contract.
@@ -129,6 +139,15 @@ class VoskLocalASR:
         self._thread.start()
 
     def stop(self) -> None:
+        """Signal the worker to exit and join it.
+
+        We only release the references to the Vosk model and
+        recognizer AFTER the worker thread has actually exited. If
+        the join times out we keep the C++ objects pinned -- their
+        ``__del__`` running while the worker is still inside
+        ``AcceptWaveform`` would corrupt the heap (and, on Windows,
+        eventually trip ucrtbase's __fastfail invariant).
+        """
         self._stop_event.set()
         # Wake up the worker if it's blocked on queue.get.
         try:
@@ -138,6 +157,14 @@ class VoskLocalASR:
         t = self._thread
         if t is not None:
             t.join(timeout=3.0)
+            if t.is_alive():
+                log.error(
+                    "Vosk worker did not exit within 3 s; leaving "
+                    "recognizer references pinned to avoid a UAF in "
+                    "libvosk teardown. The worker will eventually exit "
+                    "and the references will be reclaimed at process exit."
+                )
+                return
         self._thread = None
         self._model = None
         self._recognizer = None
@@ -212,6 +239,15 @@ class VoskLocalASR:
             if chunk is None:
                 # Sentinel from stop().
                 break
+            if chunk is _RESET_SENTINEL:
+                # Recognizer recreation MUST happen on the worker
+                # thread, never the asyncio loop -- see comment at
+                # module top.
+                try:
+                    self._do_reset_on_worker()
+                except Exception:
+                    log.exception("Vosk worker-side reset failed")
+                continue
             try:
                 self._process_chunk(chunk)
             except Exception:
@@ -310,20 +346,34 @@ class VoskLocalASR:
     # ------------------------------------------------------------------ Misc
 
     def reset(self) -> None:
-        """Re-create the recognizer to drop accumulated state.
+        """Ask the worker thread to drop accumulated recognizer state.
 
-        Called by the pipeline whenever the canonical (OpenAI) side
-        has just finalised a sentence. This:
-
-        * drops Vosk's internal partial-buffer state so the next
-          chunk starts a fresh segment,
-        * clears our own ``_committed_segments`` / ``_partial`` so
-          the preview row's text doesn't carry over into the next
-          sentence,
-        * resets the dedupe baseline.
+        Safe to call from any thread. The actual KaldiRecognizer
+        recreation is deferred to the worker via a reset sentinel on
+        the audio queue, so we never mutate the C++ recognizer object
+        from a thread other than the one currently using it. See the
+        module-level comment for the history behind this design.
         """
-        # Always clear our accumulation, even if the underlying model
-        # never loaded -- this still gives the UI a clean slate.
+        # The pure-Python display buffers are touched by the worker
+        # only inside _process_chunk / _do_reset_on_worker, so we
+        # MUST NOT clear them from the caller's thread here -- doing
+        # so would race against _emit_if_changed. Defer to the
+        # worker.
+        try:
+            self._audio_q.put_nowait(_RESET_SENTINEL)
+        except queue.Full:
+            # Queue overflow means the worker is way behind. The
+            # reset will arrive eventually once the backlog drains;
+            # if we're worried about latency we could clear the
+            # queue first, but in practice this branch is rarely
+            # hit (queue holds up to 200 chunks = 20 s of audio).
+            log.debug("Vosk audio queue full; reset sentinel dropped")
+
+    # Called only from the worker thread (via the reset sentinel in
+    # _loop). Recreates the KaldiRecognizer and clears the running
+    # accumulation. Doing both here keeps recognizer lifetime and the
+    # paired Python state strictly thread-confined.
+    def _do_reset_on_worker(self) -> None:
         self._committed_segments = []
         self._partial = ""
         self._last_emitted = ""
@@ -333,10 +383,13 @@ class VoskLocalASR:
         try:
             import vosk
 
-            self._recognizer = vosk.KaldiRecognizer(self._model, EXPECTED_SAMPLE_RATE)
+            new_rec = vosk.KaldiRecognizer(self._model, EXPECTED_SAMPLE_RATE)
             try:
-                self._recognizer.SetWords(True)
+                new_rec.SetWords(True)
             except Exception:
                 pass
+            # Swap last so callers reading _recognizer never see a
+            # transient None.
+            self._recognizer = new_rec
         except Exception:
             log.exception("Vosk recognizer reset failed")

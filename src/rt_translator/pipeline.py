@@ -307,15 +307,45 @@ async def run_pipeline(
     except asyncio.CancelledError:
         log.info("Shutting down pipeline...")
     finally:
+        # Teardown order matters. We must stop the *audio capture
+        # thread* before letting any of the ASR engines (Vosk's own
+        # worker thread; OpenAI's WS sender) tear down -- otherwise
+        # the capture thread keeps pushing PCM chunks into queues /
+        # callbacks that point at half-freed C objects, and on
+        # Windows + WASAPI a stuck recorder.record() call can leave
+        # a zombie thread behind that races the next pipeline's
+        # recorder. That race is exactly what produced the BEX64 /
+        # 0xc0000409 crashes we used to see on quick stop/start
+        # cycles. Sequence:
+        #
+        #   1. Cancel the asyncio tasks (router/sink/fanout/...).
+        #      This stops them from doing more work BUT does not
+        #      interrupt the C-level audio thread.
+        #   2. Stop the audio capture thread (blocking join). After
+        #      this returns, no more chunks enter the pipeline.
+        #   3. aclose() the ASR engines + translator. They now own
+        #      a quiescent audio stream, so their internal threads
+        #      can join without risk of UAF.
         for t in tasks:
             t.cancel()
         for t in tasks:
             with contextlib.suppress(BaseException):
                 await t
+
+        # capture.stop() is a synchronous join on the recorder
+        # thread; running it in a thread executor frees the asyncio
+        # loop to keep pumping during the join (some ASR aclose
+        # paths await on the same loop). It also lets us put a hard
+        # ceiling on how long the loop blocks here.
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, capture.stop)
+        except Exception:
+            log.exception("AudioCapture.stop raised during teardown")
+
         await canonical_asr.aclose()
         if preview_asr is not None:
             await preview_asr.aclose()
         if translator is not None:
             await translator.aclose()
-        capture.stop()
         log.info("Pipeline stopped.")
