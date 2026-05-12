@@ -87,10 +87,18 @@ class VoskASRProvider:
     """
 
     def __init__(
-        self, cfg: LocalASRConfig, preview_only: bool = False
+        self,
+        cfg: LocalASRConfig,
+        preview_only: bool = False,
+        max_utterance_s: float = 8.0,
     ) -> None:
         self._cfg = cfg
         self._preview_only = preview_only
+        # Hard cap on how long one utterance can keep accumulating in
+        # canonical mode before we force a TranscriptFinal regardless
+        # of silence. Mirrors ``ASRConfig.preview_max_duration_s``.
+        # Setting it to 0 disables the cap (silence-only finalisation).
+        self._max_utterance_s = max(0.0, float(max_utterance_s or 0.0))
         self._engine: Optional[VoskLocalASR] = None
         self._feeder_task: Optional[asyncio.Task] = None
         self._finalizer_task: Optional[asyncio.Task] = None
@@ -102,6 +110,10 @@ class VoskASRProvider:
         # CPython and we only ever care about the latest value.
         self._current_text: str = ""
         self._last_change_at: float = 0.0
+        # Wall-clock time the current utterance started accumulating
+        # (set on the first non-empty partial after a reset). Used by
+        # the silence-watcher to enforce the duration cap.
+        self._utterance_started_at: float = 0.0
         self._current_item_id: str = ""
 
     # --- StreamingASRProvider --------------------------------------
@@ -142,7 +154,13 @@ class VoskASRProvider:
             # finalise during a real pause.
             self._current_text = text
             if text:
-                self._last_change_at = time.monotonic()
+                now = time.monotonic()
+                self._last_change_at = now
+                # First non-empty partial of a fresh utterance: anchor
+                # the duration-cap start time here. Subsequent partials
+                # for the same utterance just push _last_change_at.
+                if self._utterance_started_at == 0.0:
+                    self._utterance_started_at = now
             # Tagging the preview with the *current* item id lets the
             # GUI promote the same row to the canonical entry when
             # the matching TranscriptFinal arrives later -- no
@@ -185,8 +203,20 @@ class VoskASRProvider:
             except Exception:
                 log.exception("Vosk audio feeder crashed")
 
-        # Silence watcher: emit TranscriptFinal when the partial
-        # stops changing for ``finalize_after_silence_s`` seconds.
+        # Sentence-boundary watcher: emit TranscriptFinal on either
+        #
+        #   (a) silence -- partial stopped changing for
+        #       ``finalize_after_silence_s`` seconds (the normal case),
+        #       OR
+        #   (b) duration cap -- the current utterance has been
+        #       accumulating for more than ``self._max_utterance_s``
+        #       seconds without (a) firing. Prevents the preview row
+        #       from growing without bound during continuous narration.
+        #
+        # The duration cap is the same idea as the OpenAI Realtime
+        # force-commit watchdog -- if the speaker just keeps talking,
+        # we still chop into translatable chunks so the LLM has
+        # something to work with and the overlay doesn't overflow.
         async def _silence_watcher() -> None:
             poll_s = max(0.05, min(0.2, self._cfg.finalize_after_silence_s / 5))
             try:
@@ -195,17 +225,29 @@ class VoskASRProvider:
                     text = self._current_text
                     if not text:
                         continue
-                    if (time.monotonic() - self._last_change_at) < self._cfg.finalize_after_silence_s:
+                    now = time.monotonic()
+                    silence_elapsed = now - self._last_change_at
+                    silence_trip = (
+                        silence_elapsed >= self._cfg.finalize_after_silence_s
+                    )
+                    duration_trip = (
+                        self._max_utterance_s > 0
+                        and self._utterance_started_at > 0
+                        and (now - self._utterance_started_at)
+                        >= self._max_utterance_s
+                    )
+                    if not (silence_trip or duration_trip):
                         continue
-                    # Sentence boundary: snapshot text, reset state,
-                    # emit the canonical final, then nuke Vosk's
-                    # internal recognizer so the next utterance
-                    # starts at a clean baseline.
+                    # Sentence boundary (or duration cap): snapshot
+                    # text, reset state, emit the canonical final,
+                    # then nuke Vosk's internal recognizer so the next
+                    # utterance starts at a clean baseline.
                     item_id = self._current_item_id
                     finalized_text = text.strip()
                     self._current_text = ""
                     self._current_item_id = self._new_item_id()
-                    self._last_change_at = time.monotonic()
+                    self._last_change_at = now
+                    self._utterance_started_at = 0.0
                     eng = self._engine
                     if eng is not None:
                         try:
@@ -213,6 +255,12 @@ class VoskASRProvider:
                         except Exception:
                             log.debug("Vosk reset after finalize raised", exc_info=True)
                     if finalized_text:
+                        if duration_trip and not silence_trip:
+                            log.info(
+                                "Vosk: forcing TranscriptFinal after %.1fs "
+                                "of continuous speech (duration cap).",
+                                self._max_utterance_s,
+                            )
                         assert self._event_q is not None
                         await self._event_q.put(
                             TranscriptFinal(item_id=item_id, text=finalized_text)
@@ -259,6 +307,7 @@ class VoskASRProvider:
         self._current_text = ""
         self._current_item_id = self._new_item_id()
         self._last_change_at = time.monotonic()
+        self._utterance_started_at = 0.0
         engine = self._engine
         if engine is None:
             return

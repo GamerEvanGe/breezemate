@@ -150,7 +150,23 @@ class _SubtitleEntry(QFrame):
         # MinimumExpanding, Qt would split any leftover vertical space
         # between entries and the gap would visually drift when the
         # user resizes the window.
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        #
+        # ``heightForWidth=True`` on the policy + the explicit override
+        # below is CRITICAL: the parent ``_RowsViewport`` calls
+        # ``inner_layout.heightForWidth(w)`` to decide how much room the
+        # whole stack of rows needs (which feeds the stepped-slide
+        # math). Without this override, QFrame answers -1 (no
+        # heightForWidth) and the parent VBoxLayout falls back to each
+        # row's sizeHint().height() -- i.e. the single-line height of a
+        # word-wrapped label. The result was that a long preview row
+        # under-reported its real height by ~10x, the slide target
+        # over-counted growth, and content scrolled off the top of the
+        # viewport into empty space.
+        policy = QSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
+        )
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
 
         layout = QVBoxLayout(self)
         # EN and CN must read as ONE visual unit ("a sentence"), so
@@ -204,6 +220,21 @@ class _SubtitleEntry(QFrame):
 
     def state(self) -> EntryState:
         return self._state
+
+    # heightForWidth pair -- delegates to the internal QVBoxLayout
+    # which in turn polls the wrapping QLabels. See the size-policy
+    # block in __init__ for why this delegation is mandatory.
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 (Qt naming)
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 (Qt naming)
+        lay = self.layout()
+        if lay is None:
+            return super().heightForWidth(width)
+        h = lay.heightForWidth(max(1, int(width)))
+        if h <= 0:
+            return super().heightForWidth(width)
+        return h
 
     def _update_cn_visibility(self) -> None:
         # Hide the translation row whenever we're still in the preview

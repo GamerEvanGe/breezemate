@@ -35,6 +35,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from typing import AsyncIterator, Optional
 
 import numpy as np
@@ -113,6 +114,17 @@ class OpenAIRealtimeASR:
         self._closed = False
         self._ws = None  # active connection (set inside run loop)
         self._accum: dict[str, str] = {}
+        # Time the current speech segment first appeared in the
+        # server's audio buffer (set on input_audio_buffer.speech_started,
+        # cleared on speech_stopped or transcription.completed). The
+        # forced-commit watchdog uses this to decide whether the
+        # speaker has been monologuing past the configured cap.
+        self._speech_started_at: Optional[float] = None
+        # Most recent time we manually committed via the watchdog. We
+        # rate-limit forced commits so a single long monologue can't
+        # spam the server with commits faster than it can produce
+        # transcriptions.
+        self._last_forced_commit_at: float = 0.0
 
     # --- StreamingASRProvider --------------------------------------
 
@@ -170,6 +182,10 @@ class OpenAIRealtimeASR:
                         self._send_loop(ws, audio_queue, resampler),
                         name="oai-rt-sender",
                     )
+                    watchdog = asyncio.create_task(
+                        self._commit_watchdog(ws),
+                        name="oai-rt-watchdog",
+                    )
                     try:
                         async for raw in ws:
                             try:
@@ -184,8 +200,11 @@ class OpenAIRealtimeASR:
                                 yield ev
                     finally:
                         sender.cancel()
+                        watchdog.cancel()
                         with contextlib.suppress(BaseException):
                             await sender
+                        with contextlib.suppress(BaseException):
+                            await watchdog
             except ConnectionClosed as e:
                 if self._closed:
                     return
@@ -253,6 +272,74 @@ class OpenAIRealtimeASR:
                   session["input_audio_transcription"]["model"],
                   session["input_audio_transcription"].get("language"))
 
+    async def _commit_watchdog(self, ws) -> None:
+        """Force a buffer commit if the speaker has been talking past
+        the configured ``preview_max_duration_s`` cap without server VAD
+        cutting the segment on its own.
+
+        Server VAD is the primary sentence-boundary detector and will
+        emit ``input_audio_buffer.speech_stopped`` -> ``...committed``
+        -> ``...transcription.completed`` on natural pauses. But if the
+        speaker just keeps going (rapid narration, reading aloud) we
+        would otherwise let the preview row accumulate forever. This
+        watchdog samples the elapsed-since-speech_started value and,
+        once it crosses the cap, sends ``input_audio_buffer.commit``
+        manually so the server flushes whatever it has and we get a
+        transcription out the door. The matching downstream events
+        flow through the normal ``_dispatch`` path -- the LLM polish
+        step is also given the *previous* turn as context, so a
+        mid-sentence cut still produces a coherent translation.
+        """
+        cap = float(getattr(self._asr, "preview_max_duration_s", 8.0) or 0.0)
+        if cap <= 0:
+            return  # disabled
+        # Sleep granularity. Picking 0.25 s keeps watchdog overhead
+        # negligible (~4 wakeups/sec) while still firing within
+        # quarter-second precision of the cap.
+        tick_s = 0.25
+        # Force-commit cooldown. After we manually commit, give the
+        # server at least this long to acknowledge with a
+        # transcription_completed before we'd consider another one.
+        # Prevents commit storms during a sustained monologue.
+        cooldown_s = max(1.5, cap / 4.0)
+        try:
+            while not self._closed:
+                await asyncio.sleep(tick_s)
+                started = self._speech_started_at
+                if started is None:
+                    continue
+                elapsed = time.monotonic() - started
+                if elapsed < cap:
+                    continue
+                now = time.monotonic()
+                if now - self._last_forced_commit_at < cooldown_s:
+                    continue
+                self._last_forced_commit_at = now
+                log.info(
+                    "OpenAI Realtime: speaker has talked for %.1fs without a "
+                    "VAD pause; forcing input_audio_buffer.commit to cut a "
+                    "transcription segment.",
+                    elapsed,
+                )
+                try:
+                    await ws.send(
+                        json.dumps({"type": "input_audio_buffer.commit"})
+                    )
+                except Exception:
+                    # WS likely closing; the outer reconnect loop will
+                    # handle it. Drop the speech_started marker so we
+                    # don't spam after reconnect.
+                    self._speech_started_at = None
+                    return
+                # We've requested a commit; clear the started marker so
+                # we don't re-fire until the server gives us a fresh
+                # speech_started for the NEXT utterance. (If the server
+                # has more audio queued after the commit it will emit a
+                # new speech_started and we'll start timing again.)
+                self._speech_started_at = None
+        except asyncio.CancelledError:
+            raise
+
     async def _send_loop(
         self,
         ws,
@@ -294,6 +381,17 @@ class OpenAIRealtimeASR:
 
     def _dispatch(self, msg: dict) -> Optional[ASREvent]:
         etype = msg.get("type", "")
+
+        # Track speech-segment timing for the force-commit watchdog.
+        # The server emits ``speech_started`` exactly once when its
+        # VAD believes the speaker began talking, and ``speech_stopped``
+        # / ``...completed`` when it considers the segment over. We
+        # use ``speech_started_at`` as "wall-clock origin of the
+        # current segment" and clear it on either end-of-speech signal.
+        if etype == EVENT_SPEECH_STARTED:
+            self._speech_started_at = time.monotonic()
+        elif etype in (EVENT_SPEECH_STOPPED, EVENT_FINAL, EVENT_COMMITTED):
+            self._speech_started_at = None
 
         if etype == EVENT_DELTA:
             item_id = msg.get("item_id", "")

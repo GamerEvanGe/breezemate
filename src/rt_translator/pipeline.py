@@ -67,7 +67,13 @@ def _build_canonical_asr(cfg: AppConfig) -> StreamingASRProvider:
             "Unknown ASR provider %r; falling back to vosk_local.",
             cfg.asr.provider,
         )
-    return VoskASRProvider(cfg.local_asr)
+    # Pass the duration cap so a runaway monologue still gets chunked
+    # into translatable sentences (and the overlay window doesn't get
+    # buried under one giant preview row).
+    return VoskASRProvider(
+        cfg.local_asr,
+        max_utterance_s=cfg.asr.preview_max_duration_s,
+    )
 
 
 def _build_preview_asr(cfg: AppConfig) -> Optional[VoskASRProvider]:
@@ -76,6 +82,11 @@ def _build_preview_asr(cfg: AppConfig) -> Optional[VoskASRProvider]:
     Only used when the canonical ASR is a *cloud* backend (OpenAI
     Realtime). For ``vosk_local`` the canonical Vosk already drives
     the preview row, so a second engine would just be wasted CPU.
+
+    Preview-only Vosk has its silence watcher disabled (the cloud
+    owns sentence boundaries) so the duration cap is irrelevant
+    here -- the cloud's own force-commit watchdog handles the same
+    case from the canonical side.
     """
     if cfg.asr.provider == "openai_realtime":
         return VoskASRProvider(cfg.local_asr, preview_only=True)

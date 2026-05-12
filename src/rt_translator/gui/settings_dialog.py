@@ -490,6 +490,31 @@ class SettingsDialog(QDialog):
         )
         form.addRow("句末静默时长:", self.asr_finalize_spin)
 
+        # --- Force-finalize duration cap ---------------------------
+        # When the speaker just keeps talking with no clear pause,
+        # the live-preview row would otherwise accumulate forever and
+        # eventually grow taller than the overlay window (which
+        # breaks the scroll layout). This cap forces a TranscriptFinal
+        # / OpenAI commit when the elapsed time of the current
+        # utterance exceeds it, regardless of silence. The translator
+        # picks up the chunk WITH the previous turn as context, so
+        # mid-sentence cuts still produce a coherent translation.
+        self.asr_max_duration_spin = QDoubleSpinBox(w)
+        self.asr_max_duration_spin.setRange(2.0, 60.0)
+        self.asr_max_duration_spin.setSingleStep(0.5)
+        self.asr_max_duration_spin.setDecimals(1)
+        self.asr_max_duration_spin.setSuffix(" s")
+        self.asr_max_duration_spin.setValue(
+            float(getattr(self._cfg.asr, "preview_max_duration_s", 8.0))
+        )
+        self.asr_max_duration_spin.setToolTip(
+            "实时字幕单条最长时长。超过此时长后，无论是否检测到句尾，"
+            "都会强制把当前文本送去翻译，避免悬浮窗里的实时字幕越积越长、"
+            "把整窗排版顶飞。同时翻译时会带上上一句作为上下文，"
+            "保证半句话也能翻译通顺。"
+        )
+        form.addRow("实时字幕最长:", self.asr_max_duration_spin)
+
         outer.addLayout(form)
 
         footer = QLabel(
@@ -766,6 +791,7 @@ class SettingsDialog(QDialog):
             finalize_after_silence_s=self.asr_finalize_spin.value(),
         )
         backend = self.asr_backend_combo.currentData() or "vosk_local"
+        max_duration = self.asr_max_duration_spin.value()
         if backend == "openai_realtime":
             openai_model = (
                 self.openai_asr_model_combo.currentText().strip()
@@ -775,12 +801,14 @@ class SettingsDialog(QDialog):
                 provider="openai_realtime",
                 model=openai_model,
                 language=picked_lang,
+                preview_max_duration_s=max_duration,
             )
         else:
             cfg.asr = ASRConfig(
                 provider="vosk_local",
                 model=picked_model,
                 language=picked_lang,
+                preview_max_duration_s=max_duration,
             )
 
         # Friendly guards.

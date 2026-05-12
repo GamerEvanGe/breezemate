@@ -58,6 +58,23 @@ class ASRConfig(BaseModel):
     # backend is active.
     model: str = "vosk-model-small-en-us-0.15"
     language: Optional[str] = "en"
+    # Hard cap on how long ONE live-preview utterance is allowed to
+    # accumulate before we force-finalise it. Independent of the
+    # silence-based / VAD-based sentence boundary detection:
+    #
+    # * The preferred sentence boundary is "speaker paused" -- both
+    #   Vosk's silence watcher and OpenAI's server VAD will normally
+    #   trip first.
+    # * If the user just keeps talking with no clear pause (rapid
+    #   narration, reading aloud, etc.) the preview row would
+    #   otherwise grow without bound and eventually overflow the
+    #   overlay window. This cap fires a forced commit so the LLM
+    #   gets a translatable chunk and the UI redraws a fresh
+    #   preview row.
+    # * On force-commit we likely cut the speaker mid-sentence; the
+    #   translator now passes the previous turn as context so the
+    #   LLM can polish/translate the fragment coherently.
+    preview_max_duration_s: float = Field(default=8.0, ge=2.0, le=60.0)
 
 
 class LocalASRConfig(BaseModel):
