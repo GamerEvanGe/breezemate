@@ -93,6 +93,14 @@ class _AgentEntry(QFrame):
         self._item_id = item_id
         self._state: str = "streaming"
         self.setObjectName("AgentEntry")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        # Belt-and-suspenders: entries sit inside a viewport that we
+        # are pushing very hard to stay translucent. If a QFrame
+        # autofill were to slip through, we'd see opaque rectangles
+        # behind each row.
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Preferred
         )
@@ -206,27 +214,59 @@ class AgentWindow(QWidget):
         # stepped-slide viewport in SubtitleWindow) because agent
         # replies are paragraphs of prose, not one-second sentences,
         # and users want to be able to scroll back and re-read.
+        #
+        # Getting Qt to actually honour our translucent rounded-rect
+        # plate behind a QScrollArea takes more than just
+        # ``WA_TranslucentBackground``. The scroll area's *viewport* is
+        # a separate QWidget with ``autoFillBackground`` enabled by
+        # default, which paints opaque white over our plate (the
+        # "hollow window" the user reports). We have to disable
+        # autofill on:
+        #   * the QScrollArea itself
+        #   * its viewport (the actual scrolling surface)
+        #   * the inner content widget that holds the rows
+        # and pin a stylesheet that targets BOTH QScrollArea AND every
+        # QWidget descendant -- which is what selects the viewport.
         self._scroll = QScrollArea(self)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setAutoFillBackground(False)
         self._scroll.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._scroll.viewport().setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True
+        self._scroll.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        vp = self._scroll.viewport()
+        if vp is not None:
+            vp.setAutoFillBackground(False)
+            vp.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            vp.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # The descendant selector matches the inner viewport widget
+        # which can't be styled by object-name alone (Qt internally
+        # remakes it on some style changes).
+        self._scroll.setStyleSheet(
+            "QScrollArea, QAbstractScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
         )
-        self._scroll.setStyleSheet("QScrollArea { background: transparent; }")
 
         self._rows_container = QWidget()
-        self._rows_container.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True
-        )
         self._rows_layout = QVBoxLayout(self._rows_container)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(cfg.row_spacing_px)
         self._rows_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self._rows_layout.addStretch(1)
         self._scroll.setWidget(self._rows_container)
+        # IMPORTANT: setWidget() re-enables ``autoFillBackground`` on
+        # the inner widget. Configure transparency AFTER setWidget()
+        # so our settings stick (otherwise Qt would paint an opaque
+        # rectangle over our rounded-rect plate -- the "hollow agent
+        # window" bug).
+        self._rows_container.setAutoFillBackground(False)
+        self._rows_container.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True
+        )
+        self._rows_container.setAttribute(
+            Qt.WidgetAttribute.WA_NoSystemBackground, True
+        )
         outer.addWidget(self._scroll, 1)
 
         # Resize grip in the bottom-right corner.

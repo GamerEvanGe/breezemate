@@ -509,8 +509,19 @@ class MainWindow(QMainWindow):
         # extensions so the two stay in sync automatically.
         exts = " ".join(f"*{e}" for e in AGENT_CONTEXT_EXTS)
         filter_str = f"参考文档 ({exts});;所有文件 (*.*)"
+        # Force the non-native Qt dialog. The Windows native picker
+        # is a COM object that PyInstaller's frozen bootloader can
+        # leave in a state where its first call hangs indefinitely
+        # (clicking the button puts the whole app into "not
+        # responding"). The pure-Qt dialog uses no COM and renders
+        # consistently across the development and packaged builds.
+        start_dir = str(Path.home())
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "选择上下文文件", "", filter_str
+            self,
+            "选择上下文文件",
+            start_dir,
+            filter_str,
+            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not paths:
             return
