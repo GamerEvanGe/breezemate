@@ -628,6 +628,20 @@ class SubtitleWindow(QWidget):
         self._entry_order: list[str] = []
         self._active_id: Optional[str] = None
 
+        # Dual-engine de-duplication. When the cloud (OpenAI Realtime)
+        # is the canonical ASR, Vosk runs alongside it in preview-only
+        # mode just to give the user word-level latency. The cloud and
+        # Vosk both transcribe the SAME audio period but under
+        # different item_ids ("oai-xxx" vs "vosk-yyy"), so naively
+        # routing both into the row stack produces two rows showing
+        # the same sentence. We suppress on_preview_delta as long as a
+        # cloud entry is mid-utterance (between its first delta and
+        # its final); the moment the cloud sentence wraps up, the
+        # next Vosk preview is allowed back in for the NEXT sentence.
+        # In Vosk-canonical mode the flag never flips (all item_ids
+        # are "vosk-..."), so the preview behaviour is unchanged.
+        self._cloud_in_progress: bool = False
+
         # Single long-lived "slide" animation; reused across new-row
         # arrivals. Updating its endpoint mid-flight is cheaper and
         # smoother than tearing down + restarting on every event.
@@ -863,12 +877,21 @@ class SubtitleWindow(QWidget):
 
     # ------------------------------------------------------------------ Slots
 
+    @staticmethod
+    def _is_cloud_id(item_id: str) -> bool:
+        """True when ``item_id`` was minted by a cloud canonical ASR
+        (currently OpenAI Realtime). Local Vosk uses the ``vosk-``
+        prefix; everything else is treated as cloud."""
+        return bool(item_id) and not item_id.startswith("vosk-")
+
     def on_transcript_delta(self, item_id: str, text: str) -> None:
         # The translator's polishing phase streams TranscriptDelta
         # events against an existing "active" entry (the same row that
         # Vosk just finalised). We just keep mutating the source label
         # -- the user sees the raw ASR text gradually morph into the
         # polished one with punctuation.
+        if self._is_cloud_id(item_id):
+            self._cloud_in_progress = True
         entry = self._get_or_create_entry(item_id, state="active")
         entry.update_en(text)
         self._schedule_repin()
@@ -878,6 +901,8 @@ class SubtitleWindow(QWidget):
         # polishing it). Either way, promote the row to "active" so it
         # gets the regular ASR styling and -- crucially -- the
         # translation row becomes visible and ready to accept deltas.
+        if self._is_cloud_id(item_id):
+            self._cloud_in_progress = False
         entry = self._get_or_create_entry(item_id, state="active")
         if entry.state() != "active":
             entry.set_state("active", self._cfg)
@@ -922,8 +947,25 @@ class SubtitleWindow(QWidget):
         the same widget is reused -- only its state flips to
         ``active`` -- so the user sees the live preview seamlessly
         lock in place, no row swap, no flicker.
+
+        Dual-engine de-dupe: in OpenAI-canonical mode Vosk keeps
+        transcribing the same audio that the cloud is already
+        rendering as a polished active row. The router drops the
+        *initial* Vosk preview via ``LocalPreviewReset`` as soon as
+        the cloud's first delta lands, but Vosk's worker then mints
+        a fresh utterance id (``vosk-...``) and immediately resumes
+        emitting partials for the remainder of the current speech.
+        Without the guard below, those partials would create a
+        second row directly under the cloud row, showing essentially
+        the same sentence -- which is exactly the "doubled
+        subtitles" symptom the user reports. While a cloud sentence
+        is in flight we therefore swallow preview events entirely;
+        the next sentence's preview is welcomed back as soon as the
+        cloud emits its ``TranscriptFinal``.
         """
         if not text:
+            return
+        if self._cloud_in_progress and not self._is_cloud_id(item_id):
             return
         entry = self._get_or_create_entry(item_id, state="preview")
         entry.update_en(text)
@@ -970,6 +1012,7 @@ class SubtitleWindow(QWidget):
                 widget.deleteLater()
         self._entry_order.clear()
         self._active_id = None
+        self._cloud_in_progress = False
         self._rows_viewport._set_scroll_offset(0)
 
     def set_mode_label(self, mode: str) -> None:
