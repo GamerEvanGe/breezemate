@@ -49,6 +49,7 @@ binaries += collect_dynamic_libs("soxr")
 # up by ``pipeline.py`` only when the selected profile is enabled.
 hiddenimports = []
 hiddenimports += collect_submodules("rt_translator.providers")
+hiddenimports += collect_submodules("rt_translator.agents")
 hiddenimports += collect_submodules("vosk")
 hiddenimports += collect_submodules("soundcard")
 hiddenimports += [
@@ -63,6 +64,11 @@ hiddenimports += [
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
+    # M3 context-file loaders. Pulled in dynamically by
+    # agents.context based on the uploaded file's extension, so
+    # PyInstaller's static analysis can't see the import chain.
+    "pypdf",
+    "docx",
 ]
 
 

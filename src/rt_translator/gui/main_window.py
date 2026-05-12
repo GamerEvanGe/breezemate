@@ -19,7 +19,9 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -34,7 +36,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import AppConfig, AudioConfig, SubtitleWindowConfig, save_config
+from ..agents.context import SUPPORTED_EXTENSIONS as AGENT_CONTEXT_EXTS
+from ..agents.registry import list_agent_modes
+from ..config import (
+    AgentConfig,
+    AgentWindowConfig,
+    AppConfig,
+    AudioConfig,
+    SubtitleWindowConfig,
+    save_config,
+)
 from ..device_picker import (
     DeviceInfo,
     device_still_present,
@@ -44,6 +55,7 @@ from ..device_picker import (
     save_selection,
 )
 from ..paths import asset_path
+from .agent_window import AgentWindow
 from .pipeline_controller import PipelineController
 from .settings_dialog import SettingsDialog
 from .subtitle_window import SubtitleWindow
@@ -117,7 +129,7 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.provider_label, 1)
         outer.addLayout(mode_row)
 
-        # Row 3: start/stop + settings + subtitle toggle
+        # Row 3: start/stop + settings + window toggles
         ctrl_row = QHBoxLayout()
         self.start_btn = QPushButton("▶  开始")
         self.start_btn.clicked.connect(self._on_start_clicked)
@@ -128,16 +140,59 @@ class MainWindow(QMainWindow):
         self.start_btn.setFont(font)
         ctrl_row.addWidget(self.start_btn, 1)
 
-        self.subtitle_btn = QPushButton("显示字幕浮窗")
+        self.subtitle_btn = QPushButton("字幕浮窗")
         self.subtitle_btn.setCheckable(True)
         self.subtitle_btn.setChecked(True)
         self.subtitle_btn.toggled.connect(self._toggle_subtitle_window)
         ctrl_row.addWidget(self.subtitle_btn, 0)
 
+        self.agent_btn = QPushButton("Agent 浮窗")
+        self.agent_btn.setCheckable(True)
+        self.agent_btn.setChecked(cfg.agent.enabled)
+        self.agent_btn.toggled.connect(self._toggle_agent_window)
+        ctrl_row.addWidget(self.agent_btn, 0)
+
         self.settings_btn = QPushButton("设置…")
         self.settings_btn.clicked.connect(self._open_settings)
         ctrl_row.addWidget(self.settings_btn, 0)
         outer.addLayout(ctrl_row)
+
+        # Row 3b: agent controls (only meaningful when agent is enabled)
+        agent_row = QHBoxLayout()
+        self.agent_enable_check = QCheckBox("启用 Agent")
+        self.agent_enable_check.setChecked(cfg.agent.enabled)
+        self.agent_enable_check.toggled.connect(self._on_agent_enable_toggled)
+        agent_row.addWidget(self.agent_enable_check, 0)
+
+        agent_row.addWidget(QLabel("模式:"))
+        self.agent_mode_combo = QComboBox()
+        for mode_id, mode_label in list_agent_modes():
+            self.agent_mode_combo.addItem(mode_label, userData=mode_id)
+        self._select_agent_mode(cfg.agent.mode)
+        self.agent_mode_combo.currentIndexChanged.connect(self._on_agent_mode_changed)
+        agent_row.addWidget(self.agent_mode_combo, 1)
+
+        self.agent_context_btn = QToolButton()
+        self.agent_context_btn.setText("上传上下文…")
+        self.agent_context_btn.setToolTip("添加 .txt / .md / .pdf / .docx 参考文件")
+        self.agent_context_btn.clicked.connect(self._add_agent_context_files)
+        agent_row.addWidget(self.agent_context_btn, 0)
+
+        self.agent_context_clear_btn = QToolButton()
+        self.agent_context_clear_btn.setText("清空")
+        self.agent_context_clear_btn.setToolTip("移除所有已上传的上下文文件")
+        self.agent_context_clear_btn.clicked.connect(self._clear_agent_context_files)
+        agent_row.addWidget(self.agent_context_clear_btn, 0)
+        outer.addLayout(agent_row)
+
+        # Compact summary of currently-loaded context files. Plain
+        # QLabel rather than a QListWidget so the main window stays
+        # the same height whether 0 or 4 files are loaded.
+        self.agent_context_label = QLabel("")
+        self.agent_context_label.setStyleSheet("color: #888; font-size: 9pt;")
+        self.agent_context_label.setWordWrap(True)
+        outer.addWidget(self.agent_context_label)
+        self._refresh_agent_context_label()
 
         # Row 4: status
         status_row = QHBoxLayout()
@@ -163,6 +218,13 @@ class MainWindow(QMainWindow):
         self.subtitle_window.set_mode_label(cfg.mode)
         self.subtitle_window.show()
 
+        # --- Agent window (hidden until user enables the agent) ---
+        self.agent_window = AgentWindow(cfg.agent_window)
+        self.agent_window.settings_changed.connect(self._on_agent_window_settings_changed)
+        self._refresh_agent_window_label()
+        if cfg.agent.enabled:
+            self.agent_window.show()
+
         # --- Pipeline controller ---
         self.controller = PipelineController(self)
         self.controller.transcript_delta.connect(self.subtitle_window.on_transcript_delta)
@@ -171,6 +233,13 @@ class MainWindow(QMainWindow):
         self.controller.translation_final.connect(self.subtitle_window.on_translation_final)
         self.controller.preview_delta.connect(self.subtitle_window.on_preview_delta)
         self.controller.preview_reset.connect(self.subtitle_window.on_preview_reset)
+
+        # Agent: pre-cache the source text for the row header, then
+        # plumb the agent events into the AgentWindow.
+        self.controller.transcript_final.connect(self.agent_window.on_transcript_final)
+        self.controller.agent_delta.connect(self.agent_window.on_agent_delta)
+        self.controller.agent_final.connect(self.agent_window.on_agent_final)
+        self.controller.agent_skipped.connect(self.agent_window.on_agent_skipped)
 
         self.controller.transcript_final.connect(self._on_transcript_final_log)
         self.controller.translation_final.connect(self._on_translation_final_log)
@@ -343,6 +412,16 @@ class MainWindow(QMainWindow):
                 log.exception("Failed to persist config")
             self.subtitle_window.apply_config(self._cfg.subtitle_window)
             self.subtitle_window.set_mode_label(self._cfg.mode)
+            self.agent_window.apply_config(self._cfg.agent_window)
+            self._refresh_agent_window_label()
+            self.agent_enable_check.setChecked(self._cfg.agent.enabled)
+            self.agent_btn.setChecked(self._cfg.agent.enabled)
+            self._select_agent_mode(self._cfg.agent.mode)
+            self._refresh_agent_context_label()
+            if self._cfg.agent.enabled and not self.agent_window.isVisible():
+                self.agent_window.show()
+            elif not self._cfg.agent.enabled and self.agent_window.isVisible():
+                self.agent_window.hide()
             self.mode_combo.setCurrentIndex(1 if self._cfg.mode == "translate" else 0)
             self._update_provider_label()
             if self.controller.is_running:
@@ -358,7 +437,7 @@ class MainWindow(QMainWindow):
             self.subtitle_btn.setText("隐藏字幕浮窗")
         else:
             self.subtitle_window.hide()
-            self.subtitle_btn.setText("显示字幕浮窗")
+            self.subtitle_btn.setText("字幕浮窗")
 
     def _on_subtitle_settings_changed(self, new_cfg: SubtitleWindowConfig) -> None:
         self._cfg = self._cfg.model_copy(update={"subtitle_window": new_cfg})
@@ -366,6 +445,119 @@ class MainWindow(QMainWindow):
             save_config(self._cfg, self._config_path)
         except Exception:
             log.exception("Failed to persist subtitle settings")
+
+    # ------------------------------------------------------------------ Agent UI
+
+    def _toggle_agent_window(self, on: bool) -> None:
+        if on:
+            self.agent_window.show()
+            self.agent_btn.setText("隐藏 Agent 浮窗")
+            # The user explicitly asked for the window; make sure the
+            # pipeline-side agent is enabled too. Otherwise the window
+            # would just sit empty.
+            if not self._cfg.agent.enabled:
+                self.agent_enable_check.setChecked(True)
+        else:
+            self.agent_window.hide()
+            self.agent_btn.setText("Agent 浮窗")
+
+    def _on_agent_enable_toggled(self, on: bool) -> None:
+        if on == self._cfg.agent.enabled:
+            return
+        self._cfg = self._cfg.model_copy(
+            update={"agent": self._cfg.agent.model_copy(update={"enabled": on})}
+        )
+        if on:
+            self.agent_window.show()
+            self.agent_btn.setChecked(True)
+            self.agent_btn.setText("隐藏 Agent 浮窗")
+        self._persist_config("agent toggled")
+        if self.controller.is_running:
+            QMessageBox.information(
+                self,
+                "Agent",
+                "Agent 启用状态已更新。新设置将在下次点击 \"开始\" 时生效。",
+            )
+
+    def _on_agent_mode_changed(self, _index: int) -> None:
+        mode = self.agent_mode_combo.currentData()
+        if not mode or mode == self._cfg.agent.mode:
+            return
+        self._cfg = self._cfg.model_copy(
+            update={"agent": self._cfg.agent.model_copy(update={"mode": mode})}
+        )
+        self._refresh_agent_window_label()
+        self._persist_config("agent mode changed")
+
+    def _refresh_agent_window_label(self) -> None:
+        # Use the registry's human label for the active mode so the
+        # window title and entry headers match the dropdown.
+        label = next(
+            (lbl for mid, lbl in list_agent_modes() if mid == self._cfg.agent.mode),
+            "Agent",
+        )
+        self.agent_window.set_agent_label(label)
+
+    def _select_agent_mode(self, mode: str) -> None:
+        for i in range(self.agent_mode_combo.count()):
+            if self.agent_mode_combo.itemData(i) == mode:
+                self.agent_mode_combo.setCurrentIndex(i)
+                return
+
+    def _add_agent_context_files(self) -> None:
+        # Build the file dialog filter from the loader's supported
+        # extensions so the two stay in sync automatically.
+        exts = " ".join(f"*{e}" for e in AGENT_CONTEXT_EXTS)
+        filter_str = f"参考文档 ({exts});;所有文件 (*.*)"
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择上下文文件", "", filter_str
+        )
+        if not paths:
+            return
+        existing = list(self._cfg.agent.context_files)
+        seen = set(existing)
+        for p in paths:
+            if p not in seen:
+                existing.append(p)
+                seen.add(p)
+        self._cfg = self._cfg.model_copy(
+            update={
+                "agent": self._cfg.agent.model_copy(update={"context_files": existing})
+            }
+        )
+        self._refresh_agent_context_label()
+        self._persist_config("agent context files added")
+
+    def _clear_agent_context_files(self) -> None:
+        if not self._cfg.agent.context_files:
+            return
+        self._cfg = self._cfg.model_copy(
+            update={"agent": self._cfg.agent.model_copy(update={"context_files": []})}
+        )
+        self._refresh_agent_context_label()
+        self._persist_config("agent context files cleared")
+
+    def _refresh_agent_context_label(self) -> None:
+        files = self._cfg.agent.context_files
+        if not files:
+            self.agent_context_label.setText("上下文: (未上传)")
+            return
+        names = [Path(p).name for p in files]
+        if len(names) <= 3:
+            joined = "、".join(names)
+        else:
+            joined = "、".join(names[:3]) + f" 等 {len(names)} 个文件"
+        self.agent_context_label.setText(f"上下文: {joined}")
+
+    def _on_agent_window_settings_changed(self, new_cfg: AgentWindowConfig) -> None:
+        self._cfg = self._cfg.model_copy(update={"agent_window": new_cfg})
+        self._persist_config("agent window cosmetics changed")
+
+    def _persist_config(self, reason: str) -> None:
+        try:
+            save_config(self._cfg, self._config_path)
+        except Exception:
+            log.exception("Failed to persist config (%s)", reason)
 
     # ------------------------------------------------------------------ Slots
 
@@ -441,6 +633,10 @@ class MainWindow(QMainWindow):
             log.exception("Controller shutdown failed")
         try:
             self.subtitle_window.close()
+        except Exception:
+            pass
+        try:
+            self.agent_window.close()
         except Exception:
             pass
         try:

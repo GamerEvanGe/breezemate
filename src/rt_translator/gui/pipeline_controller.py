@@ -131,6 +131,10 @@ class PipelineController(QObject):
     connection_status = Signal(str, str)
     preview_delta = Signal(str, str)
     preview_reset = Signal(str)
+    # M3 agent events: (item_id, agent_id, text).
+    agent_delta = Signal(str, str, str)
+    agent_final = Signal(str, str, str)
+    agent_skipped = Signal(str, str, str)
     # High-level lifecycle, easier to bind UI elements to than the
     # internal QThread.started/finished.
     started = Signal()
@@ -160,6 +164,9 @@ class PipelineController(QObject):
                 connection_status=self.connection_status,
                 preview_delta=self.preview_delta,
                 preview_reset=self.preview_reset,
+                agent_delta=self.agent_delta,
+                agent_final=self.agent_final,
+                agent_skipped=self.agent_skipped,
             )
         )
 

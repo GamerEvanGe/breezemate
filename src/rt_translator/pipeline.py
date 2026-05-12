@@ -31,11 +31,16 @@ import logging
 from collections import deque
 from typing import Optional, Protocol
 
+from .agents.base import Agent, AgentInput
+from .agents.context import ContextStore
+from .agents.registry import build_agent
 from .audio_capture import AudioCapture
 from .config import AppConfig
 from .console_sink import ConsoleSink
 from .device_picker import DeviceInfo
 from .events import (
+    AgentFinal,
+    AgentSkipped,
     LocalPreviewReset,
     PipelineEvent,
     TranscriptDelta,
@@ -101,6 +106,23 @@ def _build_translator(cfg: AppConfig) -> LLMTranslator:
     return OpenAICompatibleTranslator(cfg.translator, cfg.translator_endpoint())
 
 
+def _build_agent(cfg: AppConfig) -> Optional[Agent]:
+    """Instantiate the M3 agent if enabled, else None.
+
+    Failures (missing api key, unreadable context file, ...) are
+    swallowed and logged: the user can still use BreezeMate without
+    the agent layer.
+    """
+    if not cfg.agent.enabled:
+        return None
+    try:
+        context = ContextStore(cfg.agent.context_files, cfg.agent.max_context_chars)
+        return build_agent(cfg.agent, cfg.agent_endpoint(), context=context)
+    except Exception:
+        log.exception("Failed to build agent; running without it")
+        return None
+
+
 async def _asr_runner(
     provider: StreamingASRProvider,
     audio_q: "asyncio.Queue[bytes]",
@@ -147,15 +169,55 @@ async def _event_router(
     out_q: "asyncio.Queue[PipelineEvent]",
     translator: Optional[LLMTranslator],
     preview_asr: Optional[VoskASRProvider],
+    agent: Optional[Agent],
 ) -> None:
     history: deque[tuple[str, str]] = deque(maxlen=cfg.translator.context_window)
     pending: dict[str, asyncio.Task] = {}
+    agent_pending: dict[str, asyncio.Task] = {}
     # Tracks the last cloud item id we forwarded. When it changes
     # (= the cloud started a fresh utterance) we wipe the now-stale
     # local preview row and bump Vosk to a new preview item_id so
     # subsequent partials don't accidentally fall back into the
     # finalised row. Only used in dual-engine mode.
     last_cloud_item_id: Optional[str] = None
+
+    async def run_agent(item_id: str, polished_source: str, translation: str) -> None:
+        """Stream an agent reply for one finished turn.
+
+        Called either after ``TranslationFinal`` (translate mode) or
+        directly after ``TranscriptFinal`` (asr-only mode). Yields
+        AgentDelta/AgentFinal/AgentSkipped events onto the same
+        out_q the UI is already draining.
+        """
+        if agent is None:
+            return
+        if not polished_source.strip():
+            return
+        turn = AgentInput(
+            item_id=item_id,
+            source_text=polished_source,
+            translation=translation,
+            src_lang=cfg.asr.language or "en",
+        )
+        try:
+            async for aev in agent.run_stream(turn):
+                await out_q.put(aev)
+                if isinstance(aev, (AgentFinal, AgentSkipped)):
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Agent task crashed for item_id=%s", item_id)
+        finally:
+            agent_pending.pop(item_id, None)
+
+    def spawn_agent(item_id: str, polished: str, translation: str) -> None:
+        if agent is None or item_id in agent_pending:
+            return
+        agent_pending[item_id] = asyncio.create_task(
+            run_agent(item_id, polished, translation),
+            name=f"agent-{item_id}",
+        )
 
     async def translate_one(item_id: str, raw_text: str) -> None:
         try:
@@ -180,6 +242,10 @@ async def _event_router(
                     polished_source = tev.text or raw_text
                 elif isinstance(tev, TranslationFinal):
                     history.append((polished_source, tev.text))
+                    # Agent gets the polished source + translation,
+                    # not the raw ASR text. Polishing usually adds the
+                    # punctuation the agent needs to parse questions.
+                    spawn_agent(item_id, polished_source, tev.text)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -222,10 +288,19 @@ async def _event_router(
                         name=f"translate-{ev.item_id}",
                     )
                     pending[ev.item_id] = task
+                elif cfg.mode == "asr_only" and agent is not None:
+                    # No translation step, so trigger the agent
+                    # directly off the canonical TranscriptFinal.
+                    spawn_agent(ev.item_id, ev.text, "")
     except asyncio.CancelledError:
         for t in pending.values():
             t.cancel()
         for t in pending.values():
+            with contextlib.suppress(BaseException):
+                await t
+        for t in agent_pending.values():
+            t.cancel()
+        for t in agent_pending.values():
             with contextlib.suppress(BaseException):
                 await t
         raise
@@ -268,6 +343,7 @@ async def run_pipeline(
         preview_audio_q = asyncio.Queue(maxsize=200)
 
     translator = _build_translator(cfg) if cfg.mode == "translate" else None
+    agent = _build_agent(cfg)
 
     if sink is None:
         sink = ConsoleSink(
@@ -298,7 +374,7 @@ async def run_pipeline(
             name="asr-canonical",
         ),
         asyncio.create_task(
-            _event_router(cfg, asr_event_q, display_q, translator, preview_asr),
+            _event_router(cfg, asr_event_q, display_q, translator, preview_asr, agent),
             name="router",
         ),
         asyncio.create_task(sink.run(display_q), name="sink"),
@@ -359,4 +435,6 @@ async def run_pipeline(
             await preview_asr.aclose()
         if translator is not None:
             await translator.aclose()
+        if agent is not None:
+            await agent.aclose()
         log.info("Pipeline stopped.")

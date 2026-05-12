@@ -35,7 +35,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..agents.registry import list_agent_modes
 from ..config import (
+    AgentConfig,
+    AgentWindowConfig,
     ASRConfig,
     AppConfig,
     LocalASRConfig,
@@ -311,6 +314,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_translator_tab(), "翻译模型")
         tabs.addTab(self._build_asr_tab(), "语音识别")
         tabs.addTab(self._build_subtitle_tab(), "字幕浮窗")
+        tabs.addTab(self._build_agent_tab(), "Agent")
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._on_accept)
@@ -750,6 +754,143 @@ class SettingsDialog(QDialog):
         self.subtitle_translation_color_btn.set_color(defaults.translation_color)
         self.subtitle_preview_color_btn.set_color(defaults.preview_color)
 
+    # ------------------------------------------------------------------ Agent tab
+
+    def _build_agent_tab(self) -> QWidget:
+        """M3 agent panel: enable toggle, mode, provider/model, output
+        knobs, and the AgentWindow cosmetics. Provider selection re-uses
+        the same ``_ProviderPanel`` widget the translator tab uses, so
+        all auth + signup affordances are free.
+        """
+        w = QWidget(self)
+        outer = QVBoxLayout(w)
+
+        # --- Agent behaviour ---------------------------------------
+        behaviour_form = QFormLayout()
+        behaviour_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        a = self._cfg.agent
+        self.agent_enabled_check = QCheckBox("启用 Agent (基于字幕生成补充内容)", w)
+        self.agent_enabled_check.setChecked(a.enabled)
+
+        self.agent_mode_combo = QComboBox(w)
+        for mode_id, label in list_agent_modes():
+            self.agent_mode_combo.addItem(label, userData=mode_id)
+        idx = self.agent_mode_combo.findData(a.mode)
+        self.agent_mode_combo.setCurrentIndex(max(0, idx))
+
+        self.agent_target_lang_edit = QLineEdit(a.target_lang, w)
+        self.agent_target_lang_edit.setPlaceholderText("zh / en / ja / ...")
+        self.agent_target_lang_edit.setMaximumWidth(160)
+        self.agent_target_lang_edit.setToolTip(
+            "Agent 回复使用的语言。默认与译文目标语言相同，可单独设置。"
+        )
+
+        self.agent_max_tokens_spin = QSpinBox(w)
+        self.agent_max_tokens_spin.setRange(64, 4000)
+        self.agent_max_tokens_spin.setSingleStep(50)
+        self.agent_max_tokens_spin.setValue(a.max_output_tokens)
+        self.agent_max_tokens_spin.setToolTip("单次 Agent 回复的最大 token 数。")
+
+        self.agent_timeout_spin = QDoubleSpinBox(w)
+        self.agent_timeout_spin.setRange(2.0, 120.0)
+        self.agent_timeout_spin.setSingleStep(1.0)
+        self.agent_timeout_spin.setDecimals(1)
+        self.agent_timeout_spin.setSuffix(" s")
+        self.agent_timeout_spin.setValue(a.timeout_s)
+
+        self.agent_context_window_spin = QSpinBox(w)
+        self.agent_context_window_spin.setRange(0, 20)
+        self.agent_context_window_spin.setValue(a.context_window)
+
+        self.agent_max_context_spin = QSpinBox(w)
+        self.agent_max_context_spin.setRange(0, 200_000)
+        self.agent_max_context_spin.setSingleStep(1000)
+        self.agent_max_context_spin.setValue(a.max_context_chars)
+        self.agent_max_context_spin.setSuffix(" 字符")
+        self.agent_max_context_spin.setToolTip(
+            "塞入 Agent system prompt 的上下文文件总字符上限；"
+            "超过部分按上传顺序从末尾裁剪。"
+        )
+
+        behaviour_form.addRow(self.agent_enabled_check)
+        behaviour_form.addRow("Agent 模式:", self.agent_mode_combo)
+        behaviour_form.addRow("回复目标语言:", self.agent_target_lang_edit)
+        behaviour_form.addRow("最大输出 tokens:", self.agent_max_tokens_spin)
+        behaviour_form.addRow("超时:", self.agent_timeout_spin)
+        behaviour_form.addRow("Agent 上下文窗口 (轮):", self.agent_context_window_spin)
+        behaviour_form.addRow("参考文件字符上限:", self.agent_max_context_spin)
+        outer.addLayout(behaviour_form)
+
+        # --- Agent provider / model -------------------------------
+        agent_endpoint = self._cfg.agent_endpoint()
+        self._agent_panel = _ProviderPanel(
+            title="Agent LLM",
+            available=chat_presets(),
+            current_profile=a.provider,
+            current_model=a.model,
+            current_endpoint=agent_endpoint,
+            parent=w,
+        )
+        outer.addWidget(self._agent_panel)
+
+        # --- Agent window cosmetics --------------------------------
+        outer.addWidget(QLabel("<b>Agent 浮窗外观</b>"))
+        cosmetics = QFormLayout()
+        cosmetics.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        aw = self._cfg.agent_window
+
+        self.agent_top_check = QCheckBox("Agent 浮窗始终置顶", w)
+        self.agent_top_check.setChecked(aw.always_on_top)
+
+        self.agent_clickthrough_check = QCheckBox("鼠标穿透", w)
+        self.agent_clickthrough_check.setChecked(aw.click_through)
+
+        self.agent_bg_opacity_spin = QDoubleSpinBox(w)
+        self.agent_bg_opacity_spin.setRange(0.0, 1.0)
+        self.agent_bg_opacity_spin.setSingleStep(0.05)
+        self.agent_bg_opacity_spin.setDecimals(2)
+        self.agent_bg_opacity_spin.setValue(aw.background_opacity)
+
+        self.agent_text_opacity_spin = QDoubleSpinBox(w)
+        self.agent_text_opacity_spin.setRange(0.0, 1.0)
+        self.agent_text_opacity_spin.setSingleStep(0.05)
+        self.agent_text_opacity_spin.setDecimals(2)
+        self.agent_text_opacity_spin.setValue(aw.text_opacity)
+
+        self.agent_body_font_spin = QSpinBox(w)
+        self.agent_body_font_spin.setRange(8, 48)
+        self.agent_body_font_spin.setSuffix(" pt")
+        self.agent_body_font_spin.setValue(aw.body_font_size_pt)
+
+        self.agent_heading_font_spin = QSpinBox(w)
+        self.agent_heading_font_spin.setRange(8, 48)
+        self.agent_heading_font_spin.setSuffix(" pt")
+        self.agent_heading_font_spin.setValue(aw.heading_font_size_pt)
+
+        self.agent_max_rows_spin = QSpinBox(w)
+        self.agent_max_rows_spin.setRange(1, 12)
+        self.agent_max_rows_spin.setSuffix(" 条")
+        self.agent_max_rows_spin.setValue(aw.max_visible_entries)
+
+        self.agent_body_color_btn = _ColorButton(aw.body_color, w)
+        self.agent_heading_color_btn = _ColorButton(aw.heading_color, w)
+        self.agent_streaming_color_btn = _ColorButton(aw.streaming_color, w)
+
+        cosmetics.addRow(self.agent_top_check)
+        cosmetics.addRow(self.agent_clickthrough_check)
+        cosmetics.addRow("背景透明度:", self.agent_bg_opacity_spin)
+        cosmetics.addRow("文字透明度:", self.agent_text_opacity_spin)
+        cosmetics.addRow("正文字号:", self.agent_body_font_spin)
+        cosmetics.addRow("标题字号:", self.agent_heading_font_spin)
+        cosmetics.addRow("最多保留条数:", self.agent_max_rows_spin)
+        cosmetics.addRow("正文颜色:", self.agent_body_color_btn)
+        cosmetics.addRow("标题颜色:", self.agent_heading_color_btn)
+        cosmetics.addRow("流式颜色:", self.agent_streaming_color_btn)
+        outer.addLayout(cosmetics)
+
+        return w
+
     # ------------------------------------------------------------------ Accept
 
     def _on_accept(self) -> None:
@@ -849,6 +990,51 @@ class SettingsDialog(QDialog):
                 "asr_color": self.subtitle_asr_color_btn.current_color(),
                 "translation_color": self.subtitle_translation_color_btn.current_color(),
                 "preview_color": self.subtitle_preview_color_btn.current_color(),
+            }
+        )
+
+        # --- Agent ---
+        ap = self._agent_panel
+        a_preset = ap.current_preset()
+        a_endpoint = ProviderEndpoint(
+            base_url=ap.current_base_url() or a_preset.base_url,
+            api_key_env=a_preset.api_key_env,
+            auth_required=a_preset.auth_required,
+        )
+        cfg.providers[a_preset.id] = a_endpoint
+        if ap.current_api_key().strip():
+            get_secret_store().set(a_preset.api_key_env, ap.current_api_key())
+
+        cfg.agent = cfg.agent.model_copy(
+            update={
+                "enabled": self.agent_enabled_check.isChecked(),
+                "mode": self.agent_mode_combo.currentData() or cfg.agent.mode,
+                "provider": a_preset.id,
+                "model": ap.current_model() or cfg.agent.model,
+                "target_lang": self.agent_target_lang_edit.text().strip()
+                or cfg.agent.target_lang,
+                "max_output_tokens": self.agent_max_tokens_spin.value(),
+                "timeout_s": self.agent_timeout_spin.value(),
+                "context_window": self.agent_context_window_spin.value(),
+                "max_context_chars": self.agent_max_context_spin.value(),
+                # context_files are managed from the main window so they
+                # survive whatever the user picks in this dialog.
+                "context_files": cfg.agent.context_files,
+            }
+        )
+
+        cfg.agent_window = cfg.agent_window.model_copy(
+            update={
+                "always_on_top": self.agent_top_check.isChecked(),
+                "click_through": self.agent_clickthrough_check.isChecked(),
+                "background_opacity": self.agent_bg_opacity_spin.value(),
+                "text_opacity": self.agent_text_opacity_spin.value(),
+                "body_font_size_pt": self.agent_body_font_spin.value(),
+                "heading_font_size_pt": self.agent_heading_font_spin.value(),
+                "max_visible_entries": self.agent_max_rows_spin.value(),
+                "body_color": self.agent_body_color_btn.current_color(),
+                "heading_color": self.agent_heading_color_btn.current_color(),
+                "streaming_color": self.agent_streaming_color_btn.current_color(),
             }
         )
 

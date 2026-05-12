@@ -13,6 +13,9 @@ import logging
 from dataclasses import dataclass
 
 from ..events import (
+    AgentDelta,
+    AgentFinal,
+    AgentSkipped,
     ConnectionStatus,
     LocalPreviewDelta,
     LocalPreviewReset,
@@ -42,6 +45,9 @@ class SinkSignals:
     connection_status: object  # Signal(str state, str detail)
     preview_delta: object  # Signal(str item_id, str text)  - local Vosk partial
     preview_reset: object  # Signal(str item_id) - drop a stale preview row
+    agent_delta: object  # Signal(str item_id, str agent_id, str text_so_far)
+    agent_final: object  # Signal(str item_id, str agent_id, str text)
+    agent_skipped: object  # Signal(str item_id, str agent_id, str reason)
 
 
 class SignalSink:
@@ -76,3 +82,9 @@ class SignalSink:
             self.signals.preview_reset.emit(ev.item_id)
         elif isinstance(ev, ConnectionStatus):
             self.signals.connection_status.emit(ev.state, ev.detail)
+        elif isinstance(ev, AgentDelta):
+            self.signals.agent_delta.emit(ev.item_id, ev.agent_id, ev.text_so_far)
+        elif isinstance(ev, AgentFinal):
+            self.signals.agent_final.emit(ev.item_id, ev.agent_id, ev.text)
+        elif isinstance(ev, AgentSkipped):
+            self.signals.agent_skipped.emit(ev.item_id, ev.agent_id, ev.reason)

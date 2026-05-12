@@ -154,6 +154,87 @@ class DisplayConfig(BaseModel):
     refresh_hz: int = Field(default=20, ge=4, le=60)
 
 
+AgentMode = Literal["supplement", "interviewee"]
+
+
+class AgentConfig(BaseModel):
+    """Settings for the optional M3 agent layer.
+
+    The agent layer is a *second* LLM stream that consumes every
+    finalised transcript turn and writes its own content (vocabulary
+    glosses, idiom unpacking, interview-style answers, ...) into a
+    dedicated floating window. It runs alongside the translator -- not
+    in place of it -- so the user can compare the literal translation
+    with the agent's commentary.
+
+    All knobs default to a safe "off" state so existing configs keep
+    working unchanged.
+    """
+
+    # Master kill switch. When False the pipeline does not spawn the
+    # agent task at all, and the agent window stays hidden.
+    enabled: bool = False
+    # Which agent personality is active. Adding a new agent =
+    # registering a new mode here + a new class under ``agents/``.
+    mode: AgentMode = "supplement"
+    # Independent provider/model selection -- the agent intentionally
+    # does NOT inherit the translator's provider so the user can,
+    # e.g., translate via Ollama (free) but run the agent against
+    # paid GPT for higher reasoning quality.
+    provider: str = "openai"
+    model: str = "gpt-4o-mini"
+    # Caps for one agent reply. ``max_output_tokens`` is forwarded to
+    # the chat-completions call. ``timeout_s`` is the per-turn wall
+    # clock; if the LLM hangs, we still emit an AgentFinal placeholder
+    # so the UI doesn't show "spinning forever".
+    max_output_tokens: int = Field(default=400, ge=64, le=4000)
+    timeout_s: float = Field(default=20.0, gt=0)
+    # Output language for the agent reply. Mirrors translator.target_lang
+    # by default but can be overridden if the user wants, say, Chinese
+    # translations but English idiom unpacking.
+    target_lang: str = "zh"
+    # Hard limit on how much of the user-uploaded context we stuff into
+    # every agent prompt. Keeps the token bill bounded and protects
+    # short-context providers (Ollama 8k, etc.). Measured in characters
+    # because the agent code stays tokenizer-agnostic.
+    max_context_chars: int = Field(default=12000, ge=0, le=200000)
+    # Absolute paths to user-uploaded reference files. The agent reads
+    # them at start time and stitches them into the system prompt
+    # (under "Reference context"). Supported types: .txt .md .pdf .docx.
+    context_files: list[str] = Field(default_factory=list)
+    # How many recent (transcript, translation, agent_reply) triples
+    # are replayed as conversation history. Mirrors translator.context_window
+    # but tracked independently so the agent can keep its own thread.
+    context_window: int = Field(default=4, ge=0, le=20)
+
+
+class AgentWindowConfig(BaseModel):
+    """Floating overlay for the agent's output. Mirrors ``SubtitleWindowConfig``
+    but with its own geometry / colours so the user can park the two
+    windows side by side (e.g. subtitles bottom-centre, agent right-edge).
+    """
+
+    x: Optional[int] = None
+    y: Optional[int] = None
+    width: int = Field(default=520, ge=200, le=4096)
+    height: int = Field(default=380, ge=60, le=2048)
+    background_opacity: float = Field(default=0.55, ge=0.0, le=1.0)
+    text_opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+    font_family: str = "Microsoft YaHei"
+    body_font_size_pt: int = Field(default=14, ge=8, le=48)
+    heading_font_size_pt: int = Field(default=12, ge=8, le=48)
+    body_color: str = "#e0f2f1"
+    heading_color: str = "#80cbc4"
+    # Live token stream styling (text that's still being written by the LLM).
+    streaming_color: str = "#fff59d"
+    always_on_top: bool = True
+    click_through: bool = False
+    # How many recent agent replies stay on screen.
+    max_visible_entries: int = Field(default=3, ge=1, le=12)
+    row_spacing_px: int = Field(default=8, ge=0, le=40)
+    slide_animation_ms: int = Field(default=320, ge=0, le=2000)
+
+
 class SubtitleWindowConfig(BaseModel):
     """Floating subtitle overlay settings (GUI only)."""
 
@@ -214,6 +295,8 @@ class AppConfig(BaseModel):
     )
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     subtitle_window: SubtitleWindowConfig = Field(default_factory=SubtitleWindowConfig)
+    agent: AgentConfig = Field(default_factory=AgentConfig)
+    agent_window: AgentWindowConfig = Field(default_factory=AgentWindowConfig)
 
     @field_validator("providers")
     @classmethod
@@ -257,6 +340,10 @@ class AppConfig(BaseModel):
     def translator_endpoint(self) -> ProviderEndpoint:
         """Endpoint for the translation provider profile, falling back to OpenAI."""
         return self.providers.get(self.translator.provider) or self.openai_endpoint()
+
+    def agent_endpoint(self) -> ProviderEndpoint:
+        """Endpoint for the M3 agent's LLM, falling back to OpenAI."""
+        return self.providers.get(self.agent.provider) or self.openai_endpoint()
 
 
 def load_config(path: Optional[Path] = None) -> AppConfig:

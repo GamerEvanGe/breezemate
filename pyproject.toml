@@ -29,6 +29,8 @@ dependencies = [
     # downloaded on demand from inside the settings dialog -- not
     # bundled into the wheel.
     "vosk>=0.3.45",
+    "pypdf>=6.11.0",
+    "python-docx>=1.2.0",
 ]
 
 [project.optional-dependencies]
