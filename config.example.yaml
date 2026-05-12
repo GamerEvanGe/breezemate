@@ -1,0 +1,117 @@
+# Copy this file to config.yaml and tweak as needed.
+# Everything here can also be overridden via CLI flags.
+
+# Subtitle mode:
+#   asr_only  -> only show recognized speech subtitles (no translation).
+#   translate -> additionally translate finalised text to target language.
+mode: translate
+
+audio:
+  # source can be: loopback | mic | null (null => use saved selection or prompt interactively).
+  #   loopback -> capture whatever Windows is currently playing (videos, calls, music).
+  #   mic      -> capture from a physical microphone or line-in.
+  source: null
+  # Substring match against device name. null => use system default for chosen source.
+  device_name: null
+  # Audio chunk granularity for upstream WS frames. 50ms is a good balance.
+  chunk_ms: 50
+
+# Speech recognition runs entirely offline through Vosk. Pick a model
+# matching the spoken language; the GUI Settings -> "语音识别" tab can
+# download it for you. See providers/asr/vosk_model.py for the full
+# catalog of supported languages and model ids.
+asr:
+  # Only "vosk_local" is supported today. Kept as a forward-compat
+  # discriminator so a future cloud backend can be slotted in.
+  provider: vosk_local
+  # Mirror of local_asr.model below; main window reads from here for
+  # its one-line "ASR ..." summary.
+  model: vosk-model-small-en-us-0.15
+  # ISO 639-1 code of the spoken language. Used to seed the translator
+  # prompt ("translate from <src> to <tgt>"). Vosk infers language
+  # from the model itself, so this is mostly informational.
+  language: en
+
+local_asr:
+  # Vosk model id (== the folder name under %APPDATA%/rt-translator/vosk-models).
+  # Default ships nothing -- pick + download in the GUI on first launch.
+  model: vosk-model-small-en-us-0.15
+  # Minimum partial-text length before we emit it to the preview row.
+  # Filters Vosk's very-short noisy partials at the start of utterances.
+  min_partial_chars: 2
+  # Sentence-boundary detector. When the running Vosk partial stops
+  # changing for this many seconds, we emit a TranscriptFinal with
+  # the accumulated text and send it to the translator. Lower =
+  # snappier translations, but may chop a sentence at internal commas.
+  finalize_after_silence_s: 1.0
+
+translator:
+  # `provider` is the *id* of a profile inside `providers` below.
+  # Built-in presets: openai, deepseek, groq, openrouter, together,
+  # ollama, lmstudio, custom. The GUI lets you pick from a dropdown.
+  provider: openai
+  model: gpt-4o-mini
+  # Target language for translation, e.g. zh, ja, es.
+  target_lang: zh
+  # How many previous (source, target) pairs to include as context for coherence.
+  context_window: 3
+  # Per-request timeout in seconds.
+  timeout_s: 5
+
+# Endpoints. Keys are not stored here in plain text -- they live in
+# %APPDATA%\rt-translator\secrets.json (managed by the GUI) or in env
+# vars named by `api_key_env`.
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    auth_required: true
+  # Example: uncomment to enable Groq for translation. Then set
+  # `translator.provider: groq`.
+  # groq:
+  #   base_url: https://api.groq.com/openai/v1
+  #   api_key_env: GROQ_API_KEY
+  #   auth_required: true
+  # ollama:
+  #   base_url: http://localhost:11434/v1
+  #   api_key_env: OLLAMA_API_KEY
+  #   auth_required: false
+
+display:
+  # How many recent utterance rows to keep on screen (CLI only).
+  max_rows: 8
+  # Live refresh rate (Hz). 20 is smooth without thrashing the terminal.
+  refresh_hz: 20
+
+# Floating subtitle overlay window (GUI only).
+subtitle_window:
+  # Geometry. null x/y means "center bottom of primary monitor".
+  x: null
+  y: null
+  width: 900
+  height: 260
+  # 0.0 = fully transparent background, 1.0 = solid black.
+  background_opacity: 0.55
+  font_family: Microsoft YaHei
+  asr_font_size_pt: 16
+  translation_font_size_pt: 20
+  asr_color: "#cfd8dc"
+  translation_color: "#ffffff"
+  # Fixed pixel gap between adjacent finalised sentences. NOT scaled
+  # to font size on purpose: large fonts already have tall lines and
+  # adding a proportional gap was visually excessive.
+  row_spacing_px: 4
+  # Slide-up animation duration (ms) when a new sentence arrives.
+  # Set 0 to disable animation entirely.
+  slide_animation_ms: 320
+  # Colour of the live "currently being recognised" preview row (the
+  # bottom line driven by Vosk). Tints cyan by default so it stands
+  # out from the finalised EN/CN text.
+  preview_color: "#80deea"
+  always_on_top: true
+  # When true, clicks pass through to the app behind the overlay.
+  click_through: false
+  # How many recent utterances stay on screen. When a new sentence
+  # arrives and we already show this many rows, the oldest scrolls off
+  # the top.
+  max_visible_entries: 4

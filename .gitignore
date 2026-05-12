@@ -1,0 +1,62 @@
+# Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# Build artifacts -------------------------------------------------------
+# PyInstaller produces these on every `pyinstaller tools/breezemate.spec`.
+# They are reproducible from source, so we don't track them.
+build/
+dist/
+
+# Virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+
+# Secrets ---------------------------------------------------------------
+# Real env file (the .example file IS tracked as a template).
+.env
+# SecretStore JSON: not normally inside the repo (it lives in %APPDATA%)
+# but ignore explicitly in case someone copies one in for debugging.
+secrets.json
+
+# uv / pip --------------------------------------------------------------
+# uv.lock is intentionally NOT ignored: BreezeMate is an end-user app,
+# and committing the lockfile means everyone (and the .exe build) gets
+# the same dependency versions.
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE / editors ---------------------------------------------------------
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# OS noise --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project local data ----------------------------------------------------
+# User-edited runtime config (lives in %APPDATA%\rt-translator\ once the
+# app has run at least once; only sometimes also dropped in the repo
+# root by developers).
+config.yaml
+# Logs and ad-hoc test runs.
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Vosk models (only present if a developer downloads them into the repo
+# root rather than the appdata folder; can be hundreds of MB each).
+vosk-models/

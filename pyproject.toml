@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "breezemate"
+version = "0.2.0"
+description = "BreezeMate · 微伴 — Realtime offline speech subtitling and translation. Vosk (15+ languages) for ASR + any OpenAI-compatible chat endpoint for translation."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Seak" }]
+dependencies = [
+    "soundcard>=0.4.3",
+    "soxr>=0.5",
+    "numpy>=1.26",
+    "websockets>=13.0",
+    "openai>=1.50",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+    "pywin32>=306; sys_platform == 'win32'",
+    # GUI: control panel + floating subtitle overlay + settings dialog.
+    "PySide6>=6.7",
+    # On-device streaming ASR. Vosk runs entirely on CPU, supports 15+
+    # languages, and the small models are ~40-80 MB. Model files are
+    # downloaded on demand from inside the settings dialog -- not
+    # bundled into the wheel.
+    "vosk>=0.3.45",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.7"]
+
+[project.scripts]
+breezemate = "rt_translator.cli:main"
+breezemate-gui = "rt_translator.gui.app:main"
+# Backwards-compatible aliases for users who installed pre-rename.
+rt-translator = "rt_translator.cli:main"
+rt-translator-gui = "rt_translator.gui.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rt_translator"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/rt_translator",
+    "README.md",
+    "config.example.yaml",
+    ".env.example",
+    "assets/breezemate.png",
+    "assets/breezemate.ico",
+]
+
+[dependency-groups]
+dev = [
+    "pillow>=12.0",
+    "pyinstaller>=6.20",
+]
