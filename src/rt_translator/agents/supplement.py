@@ -41,21 +41,38 @@ class SupplementAgent(Agent):
     def system_prompt(self) -> str:
         ctx = super().system_prompt()
         tgt = _lang(self.cfg.target_lang)
+        depth = self.cfg.answer_depth
+        # Bullet ceiling scales with depth -- "deep" lets the agent
+        # write a fuller study note, while "concise" keeps it to a
+        # quick gloss.
+        if depth == "concise":
+            max_bullets = 2
+            vocab_quota = "ONE"
+            length_hint = "under ~15 words"
+        elif depth == "standard":
+            max_bullets = 3
+            vocab_quota = "at most TWO"
+            length_hint = "under ~20 words"
+        else:  # deep
+            max_bullets = 5
+            vocab_quota = "at most THREE"
+            length_hint = "under ~30 words; include collocations and register"
         body = (
             "You are the 'supplement' agent in a real-time subtitle app. "
             "For every transcript turn the user shows you, decide whether "
             "anything in the line would benefit a language learner who is "
             "already reading the literal translation. If yes, write a "
-            f"very short note in {tgt}. If the sentence is plain everyday "
-            "speech with no notable vocabulary / idiom / cultural item, "
-            "respond with EXACTLY the sentinel <<<SKIP>>> and nothing else.\n"
+            f"compact study note in {tgt}. If the sentence is plain "
+            "everyday speech with no notable vocabulary / idiom / "
+            "cultural item, respond with EXACTLY the sentinel "
+            "<<<SKIP>>> and nothing else.\n"
             "\n"
-            "When you DO respond, output at most three short bullet lines, "
-            "each starting with '• ' (a bullet then a space). Allowed bullet "
-            "kinds, in priority order:\n"
-            "  • Vocab / collocation: pick at most TWO non-trivial items "
-            "from the line. Give: source term -- short gloss (under ~15 "
-            f"words). Example in {tgt}.\n"
+            f"When you DO respond, output at most {max_bullets} short "
+            "bullet lines, each starting with '• ' (a bullet then a "
+            "space). Allowed bullet kinds, in priority order:\n"
+            f"  • Vocab / collocation: pick {vocab_quota} non-trivial "
+            f"items from the line. Give: source term -- short gloss "
+            f"({length_hint}). Add a tiny example in {tgt}.\n"
             "  • Idiom / fixed expression: source idiom -- literal meaning "
             "AND idiomatic meaning. Skip if the translation already nailed "
             "the idiom obviously.\n"
@@ -64,13 +81,20 @@ class SupplementAgent(Agent):
             "  • Grammar note: only when the source uses a structure that "
             "would trip up a learner (subjunctive, inversion, ellipsis...). "
             "One short line max.\n"
-            "\n"
+            + (
+                "  • Pronunciation / register tip: at most one line, only "
+                "if the line contains a tricky stress pattern, a homophone, "
+                "or a formal/informal register clash worth flagging.\n"
+                if depth == "deep"
+                else ""
+            )
+            + "\n"
             "Hard rules:\n"
             "  * Never repeat the translation itself. The user already has it.\n"
-            "  * Never produce more than three bullets total.\n"
+            f"  * Never produce more than {max_bullets} bullets total.\n"
             "  * Never invent etymology / quotations you're not sure about.\n"
             "  * No markdown headers, no preamble, no closing remark.\n"
-            "  * Output language: " + tgt + ".\n"
+            f"  * Output language: {tgt}.\n"
         )
         return f"{ctx}\n{body}" if ctx else body
 

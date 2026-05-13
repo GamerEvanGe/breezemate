@@ -155,6 +155,7 @@ class DisplayConfig(BaseModel):
 
 
 AgentMode = Literal["supplement", "interviewee"]
+AnswerDepth = Literal["concise", "standard", "deep"]
 
 
 class AgentConfig(BaseModel):
@@ -183,12 +184,33 @@ class AgentConfig(BaseModel):
     # paid GPT for higher reasoning quality.
     provider: str = "openai"
     model: str = "gpt-4o-mini"
+    # How much room to give the agent's answer. The exact wording the
+    # agent gets in its system prompt is owned by each agent class
+    # (see ``agents/base.Agent._depth_directive``):
+    #
+    # * ``concise``  -- 1-2 short paragraphs, only the key point.
+    #                   Good for fast back-and-forth.
+    # * ``standard`` -- a single substantive paragraph (~150-300 words)
+    #                   with one or two supporting details. The old
+    #                   M3-launch behaviour.
+    # * ``deep``     -- senior-engineer / coach-level reply: design
+    #                   trade-offs, edge cases, complexity, named
+    #                   techniques, concrete metrics. Default, because
+    #                   anything less makes the interviewee agent feel
+    #                   markedly weaker than the same question typed
+    #                   into ChatGPT.
+    answer_depth: AnswerDepth = "deep"
     # Caps for one agent reply. ``max_output_tokens`` is forwarded to
     # the chat-completions call. ``timeout_s`` is the per-turn wall
     # clock; if the LLM hangs, we still emit an AgentFinal placeholder
     # so the UI doesn't show "spinning forever".
-    max_output_tokens: int = Field(default=400, ge=64, le=4000)
-    timeout_s: float = Field(default=20.0, gt=0)
+    #
+    # 1500 tokens is comfortably above what a 600-word interview-style
+    # reply needs while staying well under the per-request limit of
+    # every current OpenAI-protocol provider, so the default is safe
+    # for free providers (Ollama, glm-4-flash, ...) too.
+    max_output_tokens: int = Field(default=1500, ge=64, le=8000)
+    timeout_s: float = Field(default=45.0, gt=0)
     # Output language for the agent reply. Mirrors translator.target_lang
     # by default but can be overridden if the user wants, say, Chinese
     # translations but English idiom unpacking.

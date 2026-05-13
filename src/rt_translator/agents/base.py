@@ -55,6 +55,47 @@ class AgentInput:
 AgentEvent = AgentDelta | AgentFinal | AgentSkipped
 
 
+_DEPTH_DIRECTIVES: dict[str, str] = {
+    "concise": (
+        "Length: 1-2 short paragraphs (roughly 60-150 words). Cover only "
+        "the core point. Skip examples unless the question is explicitly "
+        "asking for one."
+    ),
+    "standard": (
+        "Length: a single substantive paragraph or two (roughly 150-300 "
+        "words). Cover the main idea plus one supporting concrete detail "
+        "from the reference context. Mention one trade-off or edge case "
+        "when the question warrants it."
+    ),
+    "deep": (
+        "Length: as long as a strong senior-engineer reply requires -- "
+        "for technical questions this is typically 300-700 words; for "
+        "system-design questions up to ~900 words is acceptable. Do NOT "
+        "artificially shorten the answer. A thin answer is a worse "
+        "failure mode than a slightly long one.\n"
+        "\n"
+        "When the question is technical, the answer should normally "
+        "cover:\n"
+        "  * the core idea in plain language;\n"
+        "  * the typical implementation or approach, named explicitly "
+        "    (algorithm name, design pattern, library, protocol, ...);\n"
+        "  * the main trade-offs and at least one realistic edge case "
+        "    or failure mode;\n"
+        "  * a concrete supporting detail from the user's reference "
+        "    context (project, technology, metric) when relevant;\n"
+        "  * for algorithms: time / space complexity in big-O;\n"
+        "  * for system design: a brief sketch of the components, the "
+        "    scaling story, and what you would monitor.\n"
+        "\n"
+        "Use multiple short paragraphs separated by a blank line for "
+        "readability. Numbered steps are fine when describing a "
+        "procedure; inline backticks are fine for identifiers, function "
+        "names, and short code-like snippets. Do NOT use markdown "
+        "headers, bold, or bullet markers (the UI renders plain text)."
+    ),
+}
+
+
 class Agent:
     """Streaming LLM agent. Subclasses override the prompt builders."""
 
@@ -104,6 +145,16 @@ class Agent:
             f"{ctx}\n"
             "<<<USER_CONTEXT_END>>>\n"
         )
+
+    def depth_directive(self) -> str:
+        """Return the system-prompt sentence(s) that pin the desired
+        answer length / detail.
+
+        Subclasses splice this into their personality block so the
+        ``answer_depth`` setting consistently moves *every* agent's
+        verbosity, not just the interviewee's.
+        """
+        return _DEPTH_DIRECTIVES.get(self.cfg.answer_depth, _DEPTH_DIRECTIVES["deep"])
 
     def user_message(self, turn: AgentInput) -> str:
         """Render one transcript turn as the user message for the LLM.

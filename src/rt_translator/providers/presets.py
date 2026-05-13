@@ -57,12 +57,20 @@ PRESETS: tuple[ProviderPreset, ...] = (
         label="OpenAI (官方付费 / 精度最高)",
         base_url="https://api.openai.com/v1",
         api_key_env="OPENAI_API_KEY",
-        notes="付费。GPT-4o 系列翻译质量最高，但需要海外网络。",
+        notes=(
+            "付费。Agent 推荐用 gpt-5 / gpt-5.5 等推理型模型以获得"
+            "媲美 ChatGPT App 的回答质量；翻译用 gpt-4o-mini 即可。"
+        ),
         suggested_chat_models=(
             "gpt-4o-mini",
             "gpt-4o",
             "gpt-4.1-mini",
             "gpt-4.1",
+            "gpt-5-mini",
+            "gpt-5",
+            "gpt-5.5",
+            "o3-mini",
+            "o3",
         ),
         signup_url="https://platform.openai.com/api-keys",
     ),

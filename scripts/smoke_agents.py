@@ -159,6 +159,67 @@ def test_agent_streaming_skipped() -> None:
     print("  agent streaming (skipped): OK")
 
 
+def test_interviewee_depth_directive() -> None:
+    """The interviewee agent's system prompt should change shape based on
+    the configured ``answer_depth``, and must always contain a length
+    budget. This guards the fix for "interviewee answers are too short
+    compared to ChatGPT"."""
+    from rt_translator.agents.interviewee import IntervieweeAgent
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+
+    seen_lengths: dict[str, int] = {}
+    for depth in ("concise", "standard", "deep"):
+        cfg = AgentConfig(
+            enabled=True,
+            mode="interviewee",
+            provider="openai",
+            model="gpt-4o-mini",
+            answer_depth=depth,  # type: ignore[arg-type]
+        )
+        agent = IntervieweeAgent(cfg, endpoint, context="")
+        prompt = agent.system_prompt()
+        assert "interviewee" in prompt.lower(), prompt[:200]
+        assert "step 1" in prompt.lower(), "missing classify step"
+        assert "STAR" in prompt, "missing behavioural structure guidance"
+        assert "<<<SKIP>>>" in prompt, "missing skip sentinel"
+        # The depth directive should be embedded.
+        assert "Length" in prompt, prompt[-400:]
+        seen_lengths[depth] = len(prompt)
+
+    # Deep must give strictly more guidance text than standard, which
+    # must give strictly more than concise. If somebody accidentally
+    # blows away the depth knob, this catches it.
+    assert (
+        seen_lengths["deep"] > seen_lengths["standard"] > seen_lengths["concise"]
+    ), seen_lengths
+
+    # And under "deep", the prompt should explicitly forbid artificial
+    # shortening -- that one line is what makes the difference between
+    # a 60-word reply and a 500-word reply on the same model.
+    cfg_deep = AgentConfig(
+        enabled=True, mode="interviewee", provider="openai", model="gpt-4o-mini",
+        answer_depth="deep",
+    )
+    deep_prompt = IntervieweeAgent(cfg_deep, endpoint, context="").system_prompt()
+    assert "Do NOT" in deep_prompt and "artificially" in deep_prompt.lower(), deep_prompt[-600:]
+    print("  interviewee depth directive: OK")
+
+
+def test_agent_config_defaults() -> None:
+    """Regression guard: defaults must match the M3.1 'GPT-5.5 parity'
+    rework. If somebody bumps them down again the interviewee agent
+    will quietly start producing thin answers."""
+    from rt_translator.config import AgentConfig
+
+    cfg = AgentConfig()
+    assert cfg.answer_depth == "deep", cfg.answer_depth
+    assert cfg.max_output_tokens >= 1500, cfg.max_output_tokens
+    assert cfg.timeout_s >= 30.0, cfg.timeout_s
+    print("  agent config defaults: OK")
+
+
 # -------------------------- 3. agent window UI --------------------------------
 
 
@@ -201,6 +262,8 @@ def main() -> int:
     test_context_store()
     test_agent_streaming_normal()
     test_agent_streaming_skipped()
+    test_interviewee_depth_directive()
+    test_agent_config_defaults()
     test_agent_window()
     print("PASS: agents smoke OK")
     return 0

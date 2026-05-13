@@ -786,18 +786,46 @@ class SettingsDialog(QDialog):
             "Agent 回复使用的语言。默认与译文目标语言相同，可单独设置。"
         )
 
+        self.agent_depth_combo = QComboBox(w)
+        # (id, label) pairs -- the order matches "shortest to longest".
+        _depth_items = (
+            ("concise", "简洁 (1-2 段, 约 60-150 字)"),
+            ("standard", "标准 (单段或两段, 约 150-300 字)"),
+            ("deep", "深度 (类似 ChatGPT 高质回答, 300-700+ 字)"),
+        )
+        for depth_id, depth_label in _depth_items:
+            self.agent_depth_combo.addItem(depth_label, userData=depth_id)
+        idx = self.agent_depth_combo.findData(a.answer_depth)
+        self.agent_depth_combo.setCurrentIndex(max(0, idx))
+        self.agent_depth_combo.setToolTip(
+            "决定 Agent 回答的详细程度。如果觉得回答太短太空，请选"
+            "‘深度’；如果只想要简短提示，选‘简洁’。"
+        )
+
         self.agent_max_tokens_spin = QSpinBox(w)
-        self.agent_max_tokens_spin.setRange(64, 4000)
-        self.agent_max_tokens_spin.setSingleStep(50)
+        # 8000 covers a ~6000-word reply, more than enough headroom for
+        # any single agent turn. Step is 100 so users can sweep quickly.
+        self.agent_max_tokens_spin.setRange(64, 8000)
+        self.agent_max_tokens_spin.setSingleStep(100)
         self.agent_max_tokens_spin.setValue(a.max_output_tokens)
-        self.agent_max_tokens_spin.setToolTip("单次 Agent 回复的最大 token 数。")
+        self.agent_max_tokens_spin.setToolTip(
+            "单次 Agent 回复的最大 token 数。\n"
+            "想要类似 ChatGPT 那样具体详细的回答, 建议 1500 以上。"
+        )
 
         self.agent_timeout_spin = QDoubleSpinBox(w)
-        self.agent_timeout_spin.setRange(2.0, 120.0)
+        # Long deep-mode replies on slower providers (DeepSeek-Reasoner,
+        # o3, etc.) regularly stream for 30-60 seconds end-to-end, so
+        # raise the upper bound to give them room.
+        self.agent_timeout_spin.setRange(2.0, 300.0)
         self.agent_timeout_spin.setSingleStep(1.0)
         self.agent_timeout_spin.setDecimals(1)
         self.agent_timeout_spin.setSuffix(" s")
         self.agent_timeout_spin.setValue(a.timeout_s)
+        self.agent_timeout_spin.setToolTip(
+            "Agent 单轮回复的超时时间。深度回答 + 较慢的推理模型"
+            "(o3 / DeepSeek-Reasoner) 可能需要 60 秒以上, 请按需调高。"
+        )
 
         self.agent_context_window_spin = QSpinBox(w)
         self.agent_context_window_spin.setRange(0, 20)
@@ -816,6 +844,7 @@ class SettingsDialog(QDialog):
         behaviour_form.addRow(self.agent_enabled_check)
         behaviour_form.addRow("Agent 模式:", self.agent_mode_combo)
         behaviour_form.addRow("回复目标语言:", self.agent_target_lang_edit)
+        behaviour_form.addRow("回答详细程度:", self.agent_depth_combo)
         behaviour_form.addRow("最大输出 tokens:", self.agent_max_tokens_spin)
         behaviour_form.addRow("超时:", self.agent_timeout_spin)
         behaviour_form.addRow("Agent 上下文窗口 (轮):", self.agent_context_window_spin)
@@ -1013,6 +1042,8 @@ class SettingsDialog(QDialog):
                 "model": ap.current_model() or cfg.agent.model,
                 "target_lang": self.agent_target_lang_edit.text().strip()
                 or cfg.agent.target_lang,
+                "answer_depth": self.agent_depth_combo.currentData()
+                or cfg.agent.answer_depth,
                 "max_output_tokens": self.agent_max_tokens_spin.value(),
                 "timeout_s": self.agent_timeout_spin.value(),
                 "context_window": self.agent_context_window_spin.value(),
