@@ -39,6 +39,12 @@ class _Worker(QObject):
 
     finished = Signal()
     error = Signal(str)
+    # Emitted from the worker thread once the asyncio loop is up *and*
+    # the main task has been scheduled. The PipelineController relays
+    # this as ``started`` to the GUI. This lets us tell the user
+    # "pipeline is actually booting" instead of "I'm about to start
+    # booting it" -- the former is what the user cares about.
+    running = Signal()
 
     def __init__(
         self,
@@ -52,15 +58,17 @@ class _Worker(QObject):
         self._sink = sink
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._main_task: Optional[asyncio.Task] = None
+        # Set as soon as the loop is alive and ``_main_task`` is
+        # assigned. Currently only used internally as a race-detector;
+        # no GUI code blocks on it any more (see ``request_stop``).
         self._ready = threading.Event()
-
-    def wait_until_ready(self, timeout: float = 5.0) -> bool:
-        """Block the caller until the worker's event loop is running.
-
-        Needed so ``request_stop`` can be safely scheduled even if the
-        user immediately clicks Stop after Start.
-        """
-        return self._ready.wait(timeout=timeout)
+        # Set by ``request_stop`` so a Stop click that lands BEFORE
+        # the worker has finished booting is still honoured -- ``run``
+        # checks this flag right after creating the main task and
+        # cancels straight away if it has been set in the meantime.
+        # This is what lets us drop the old blocking ``wait_until_ready``
+        # call from the GUI thread.
+        self._stop_requested = threading.Event()
 
     def run(self) -> None:
         """Slot connected to ``QThread.started``. Runs until the main
@@ -75,6 +83,16 @@ class _Worker(QObject):
                 name="rt-gui-pipeline",
             )
             self._ready.set()
+            # Race: if Stop was clicked between PipelineController.start()
+            # returning and us getting here, ``request_stop`` may have
+            # tried to schedule a cancel against a still-None loop and
+            # silently dropped it. Catch that case explicitly.
+            if self._stop_requested.is_set():
+                self._main_task.cancel()
+            # Tell the GUI we're really up. Auto-connection across
+            # threads is queued, so this is safe even though we're on
+            # the worker thread.
+            self.running.emit()
             loop.run_until_complete(self._main_task)
         except asyncio.CancelledError:
             log.info("Pipeline worker cancelled cleanly.")
@@ -100,10 +118,17 @@ class _Worker(QObject):
             self._loop = None
             self._main_task = None
             self._ready.clear()
+            self._stop_requested.clear()
             self.finished.emit()
 
     def request_stop(self) -> None:
-        """Thread-safe cancellation. Called from the GUI thread."""
+        """Thread-safe cancellation. Called from the GUI thread.
+
+        Always sets ``_stop_requested`` first so a Stop click that
+        lands before ``run`` has assigned ``_loop`` is still honoured
+        when the loop comes up moments later.
+        """
+        self._stop_requested.set()
         loop = self._loop
         task = self._main_task
         if loop is None or task is None:
@@ -137,7 +162,17 @@ class PipelineController(QObject):
     agent_skipped = Signal(str, str, str)
     # High-level lifecycle, easier to bind UI elements to than the
     # internal QThread.started/finished.
+    #
+    # * ``starting`` fires synchronously from ``start()`` (the click
+    #   handler is still running) so the UI can immediately flip the
+    #   button to "启动中…" without waiting on the worker.
+    # * ``started`` fires from the worker thread once the asyncio
+    #   loop is up and the main pipeline task is scheduled.
+    # * ``stopping`` mirrors ``starting`` for the Stop click.
+    # * ``stopped`` fires once the worker thread has fully torn down.
+    starting = Signal()
     started = Signal()
+    stopping = Signal()
     stopped = Signal()
     error = Signal(str)
 
@@ -178,22 +213,30 @@ class PipelineController(QObject):
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_thread_finished)
         worker.error.connect(self.error)
+        # Cross-thread queued connection: the worker fires ``running``
+        # from inside its own thread, Qt re-marshals it onto the GUI
+        # thread before our ``started`` signal emits. This is what
+        # lets us drop the old ``wait_until_ready`` blocking wait.
+        worker.running.connect(self.started)
 
         self._thread = thread
         self._worker = worker
 
+        # Tell the GUI we're transitioning *before* spawning the thread
+        # so the click feels instant. The actual pipeline boot happens
+        # asynchronously after thread.start().
+        self.starting.emit()
         thread.start()
-        # Wait briefly for the loop to spin up. If it never becomes
-        # ready, the worker probably crashed during setup -- the error
-        # signal will fire shortly and stop() becomes a no-op.
-        worker.wait_until_ready(timeout=3.0)
-        self.started.emit()
 
     def stop(self) -> None:
         if not self.is_running:
             return
         worker = self._worker
         if worker is not None:
+            # Same trick on the way out: tell the UI we're stopping now,
+            # so the button can flip to "停止中…" before the (potentially
+            # multi-second) teardown begins.
+            self.stopping.emit()
             worker.request_stop()
 
     def _on_thread_finished(self) -> None:

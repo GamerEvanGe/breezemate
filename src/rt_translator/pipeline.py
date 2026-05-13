@@ -184,10 +184,15 @@ async def _event_router(
     async def run_agent(item_id: str, polished_source: str, translation: str) -> None:
         """Stream an agent reply for one finished turn.
 
-        Called either after ``TranslationFinal`` (translate mode) or
-        directly after ``TranscriptFinal`` (asr-only mode). Yields
-        AgentDelta/AgentFinal/AgentSkipped events onto the same
-        out_q the UI is already draining.
+        Spawned from the canonical ``TranscriptFinal`` handler so the
+        agent's LLM call runs *in parallel* with the translator's
+        polish + translate stream. ``translation`` is therefore
+        currently always ``""``; the parameter is kept on the public
+        signature so a future tweak (e.g. waiting briefly for the
+        polished version on slow ASR providers) doesn't require
+        plumbing changes downstream. Yields AgentDelta / AgentFinal /
+        AgentSkipped events onto the same out_q the UI is already
+        draining.
         """
         if agent is None:
             return
@@ -242,10 +247,12 @@ async def _event_router(
                     polished_source = tev.text or raw_text
                 elif isinstance(tev, TranslationFinal):
                     history.append((polished_source, tev.text))
-                    # Agent gets the polished source + translation,
-                    # not the raw ASR text. Polishing usually adds the
-                    # punctuation the agent needs to parse questions.
-                    spawn_agent(item_id, polished_source, tev.text)
+                    # The agent was already spawned on the canonical
+                    # ASR's TranscriptFinal so it starts streaming in
+                    # parallel with this translation -- we don't kick
+                    # off a *second* agent task here. See the comment
+                    # at ``spawn_agent`` for why this is a big latency
+                    # win on translate-mode turns.
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -279,19 +286,30 @@ async def _event_router(
             await out_q.put(ev)
 
             if isinstance(ev, TranscriptFinal):
+                # Fan the canonical final out to BOTH the translator
+                # (if running) and the agent (if running) in parallel.
+                # Doing them sequentially -- the way it used to work,
+                # spawning the agent only on TranslationFinal -- meant
+                # the agent never started thinking until the slowest
+                # link in the chain (translator polish + translate)
+                # had finished streaming, easily adding 1-3 s of
+                # avoidable latency to every reply. Modern Realtime
+                # ASR (gpt-4o-mini-transcribe and friends) already
+                # ships punctuation in the raw final, which is enough
+                # for the agent's question-classifier; Vosk-only mode
+                # ships unpunctuated text but the agent prompts are
+                # robust against that.
+                if agent is not None:
+                    spawn_agent(ev.item_id, ev.text, "")
                 if cfg.mode == "translate" and translator is not None:
-                    # Fire-and-forget; multiple translations can stream in
-                    # parallel which keeps the sink responsive even if one
-                    # is slow.
+                    # Fire-and-forget; multiple translations can stream
+                    # in parallel which keeps the sink responsive even
+                    # if one is slow.
                     task = asyncio.create_task(
                         translate_one(ev.item_id, ev.text),
                         name=f"translate-{ev.item_id}",
                     )
                     pending[ev.item_id] = task
-                elif cfg.mode == "asr_only" and agent is not None:
-                    # No translation step, so trigger the agent
-                    # directly off the canonical TranscriptFinal.
-                    spawn_agent(ev.item_id, ev.text, "")
     except asyncio.CancelledError:
         for t in pending.values():
             t.cancel()

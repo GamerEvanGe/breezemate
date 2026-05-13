@@ -244,7 +244,13 @@ class MainWindow(QMainWindow):
         self.controller.transcript_final.connect(self._on_transcript_final_log)
         self.controller.translation_final.connect(self._on_translation_final_log)
         self.controller.connection_status.connect(self._on_status_changed)
+        # Four-state lifecycle: starting / started / stopping / stopped.
+        # The two transient states (starting / stopping) repaint the
+        # button immediately on click so the user never sees a "dead"
+        # button waiting on a multi-second pipeline boot or teardown.
+        self.controller.starting.connect(self._on_starting)
         self.controller.started.connect(self._on_started)
+        self.controller.stopping.connect(self._on_stopping)
         self.controller.stopped.connect(self._on_stopped)
         self.controller.error.connect(self._on_error)
 
@@ -572,8 +578,24 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Slots
 
+    def _on_starting(self) -> None:
+        """Fired synchronously from ``controller.start()`` -- the worker
+        thread may not have spawned yet, but the user clicked Start and
+        we owe them visible feedback right now."""
+        self.start_btn.setText("⏳  启动中…")
+        self.start_btn.setEnabled(False)
+        self.status_dot.setStyleSheet(
+            f"color: {_STATUS_COLORS['connecting']}; font-size: 16pt;"
+        )
+        self.status_text.setText("正在启动…")
+
     def _on_started(self) -> None:
+        """Fired from the worker thread once the asyncio loop is up
+        and the main pipeline task has been scheduled. We may not be
+        *connected* to the cloud yet -- ``connection_status`` events
+        will refine the status text shortly."""
         self.start_btn.setText("■  停止")
+        self.start_btn.setEnabled(True)
         self.status_dot.setStyleSheet(
             f"color: {_STATUS_COLORS['connecting']}; font-size: 16pt;"
         )
@@ -582,12 +604,30 @@ class MainWindow(QMainWindow):
             "BreezeMate", "已开始转写", QSystemTrayIcon.MessageIcon.Information, 1500
         )
 
+    def _on_stopping(self) -> None:
+        """Fired synchronously from ``controller.stop()``. Pipeline
+        teardown can take 2-3 s on Windows (WASAPI shutdown, OpenAI
+        Realtime WS close); show the user we heard the click."""
+        self.start_btn.setText("⏳  停止中…")
+        self.start_btn.setEnabled(False)
+        self.status_dot.setStyleSheet(
+            f"color: {_STATUS_COLORS['connecting']}; font-size: 16pt;"
+        )
+        self.status_text.setText("正在停止…")
+
     def _on_stopped(self) -> None:
         self.start_btn.setText("▶  开始")
+        self.start_btn.setEnabled(True)
         self.status_dot.setStyleSheet(f"color: {_STATUS_COLORS['idle']}; font-size: 16pt;")
         self.status_text.setText("空闲")
 
     def _on_error(self, msg: str) -> None:
+        # Whatever state the button was in, make sure it's clickable
+        # again so the user can retry. The ``stopped`` signal will fire
+        # shortly after this too, but emitting both is harmless and
+        # the user shouldn't see "启动中…" stuck after a failure.
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("▶  开始")
         self.status_dot.setStyleSheet(f"color: {_STATUS_COLORS['error']}; font-size: 16pt;")
         self.status_text.setText(f"错误: {msg}")
         QMessageBox.critical(self, "Pipeline 异常", msg)
