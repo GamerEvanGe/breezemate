@@ -365,6 +365,106 @@ def test_temperature_dropped_for_o3() -> None:
     print("  o3 reasoning model adaptation: OK")
 
 
+def test_reply_mode_source_default() -> None:
+    """Default reply_mode is 'source' -- the interviewee answers in the
+    audio language, NOT in target_lang. Regression guard for the
+    user-reported issue 'agent only replies in one language'."""
+    from rt_translator.agents.interviewee import IntervieweeAgent
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+    cfg = AgentConfig(enabled=True, mode="interviewee", provider="openai", model="gpt-4o-mini")
+    assert cfg.reply_mode == "source", cfg.reply_mode
+
+    agent = IntervieweeAgent(cfg, endpoint, context="", src_lang="en")
+    prompt = agent.system_prompt()
+    # The source-language directive must be present and reference the
+    # audio language explicitly.
+    assert "REPLY LANGUAGE" in prompt, prompt
+    assert "English" in prompt, prompt
+    # And the old hard-coded "write in {target_lang}" line must NOT be
+    # there any more -- that was the original bug.
+    assert "write in Simplified Chinese" not in prompt, (
+        "interviewee prompt still hard-codes target_lang"
+    )
+    print("  default reply_mode = source: OK")
+
+
+def test_reply_mode_source_and_translation_layout() -> None:
+    """The bilingual mode must spell out the alternating paragraph
+    layout the user asked for ('一段原文回答、一段翻译, 交替显示')."""
+    from rt_translator.agents.interviewee import IntervieweeAgent
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+    cfg = AgentConfig(
+        enabled=True,
+        mode="interviewee",
+        provider="openai",
+        model="gpt-4o-mini",
+        reply_mode="source_and_translation",
+        target_lang="zh",
+    )
+    agent = IntervieweeAgent(cfg, endpoint, context="", src_lang="en")
+    prompt = agent.system_prompt()
+
+    # Both languages must be named.
+    assert "English" in prompt and "Simplified Chinese" in prompt, prompt
+    # The structural template should appear, with paragraph 1 / 2
+    # placeholders in BOTH languages.
+    assert "paragraph 1" in prompt, prompt
+    assert "paragraph 2" in prompt, prompt
+    # The anti-grouping rule must be explicit.
+    assert "Do NOT group" in prompt or "do not group" in prompt.lower(), prompt
+    print("  reply_mode = source_and_translation layout: OK")
+
+
+def test_reply_mode_supplement_monolingual_vs_bilingual() -> None:
+    """SupplementAgent must follow the same source/bilingual switch:
+    'source' -> glosses entirely in src_lang;
+    'source_and_translation' -> bilingual em-dash bullets."""
+    from rt_translator.agents.supplement import SupplementAgent
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+
+    cfg_src = AgentConfig(
+        enabled=True, mode="supplement", provider="openai",
+        model="gpt-4o-mini", reply_mode="source",
+    )
+    src_prompt = SupplementAgent(cfg_src, endpoint, context="", src_lang="en").system_prompt()
+    assert "English" in src_prompt, src_prompt
+    assert "Do not include" in src_prompt, src_prompt  # no zh translation
+
+    cfg_both = AgentConfig(
+        enabled=True, mode="supplement", provider="openai",
+        model="gpt-4o-mini", reply_mode="source_and_translation",
+    )
+    both_prompt = SupplementAgent(cfg_both, endpoint, context="", src_lang="en").system_prompt()
+    assert "English" in both_prompt and "Simplified Chinese" in both_prompt, both_prompt
+    assert "bilingual" in both_prompt.lower(), both_prompt
+    print("  supplement reply-mode switch: OK")
+
+
+def test_src_lang_threaded_through_agent() -> None:
+    """src_lang must travel from cfg.asr.language -> build_agent ->
+    Agent constructor and end up in the system prompt."""
+    from rt_translator.agents.interviewee import IntervieweeAgent
+    from rt_translator.agents.registry import build_agent
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+    cfg = AgentConfig(enabled=True, mode="interviewee", provider="openai", model="gpt-4o-mini")
+    agent = build_agent(cfg, endpoint, context=None, src_lang="ja")
+    assert isinstance(agent, IntervieweeAgent)
+    prompt = agent.system_prompt()
+    assert "Japanese" in prompt, prompt
+    assert "English" not in prompt or prompt.count("English") < prompt.count("Japanese"), (
+        "Japanese src_lang should dominate prompt over the en default"
+    )
+    print("  src_lang plumbing: OK")
+
+
 def test_legacy_model_unchanged() -> None:
     """Non-OpenAI / legacy models must keep using `max_tokens` and
     `temperature`. Otherwise we'd break free providers like glm-4-flash,
@@ -429,6 +529,10 @@ def main() -> int:
     test_model_family_caps()
     test_max_tokens_rename_for_gpt5()
     test_temperature_dropped_for_o3()
+    test_reply_mode_source_default()
+    test_reply_mode_source_and_translation_layout()
+    test_reply_mode_supplement_monolingual_vs_bilingual()
+    test_src_lang_threaded_through_agent()
     test_legacy_model_unchanged()
     test_agent_window()
     print("PASS: agents smoke OK")

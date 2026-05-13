@@ -779,11 +779,44 @@ class SettingsDialog(QDialog):
         idx = self.agent_mode_combo.findData(a.mode)
         self.agent_mode_combo.setCurrentIndex(max(0, idx))
 
+        # Reply language layout: "source" (audio language only, the
+        # new default) vs "source + translation" (alternating
+        # paragraph-by-paragraph, original then translation).
+        self.agent_reply_mode_combo = QComboBox(w)
+        _reply_mode_items = (
+            ("source", "仅音频语言 (与识别语种一致)"),
+            ("source_and_translation", "音频语言 + 翻译 (逐段交替)"),
+        )
+        for rid, rlabel in _reply_mode_items:
+            self.agent_reply_mode_combo.addItem(rlabel, userData=rid)
+        idx = self.agent_reply_mode_combo.findData(a.reply_mode)
+        self.agent_reply_mode_combo.setCurrentIndex(max(0, idx))
+        self.agent_reply_mode_combo.setToolTip(
+            "Agent 回复的语言模式。\n"
+            "  • 仅音频语言: Agent 用语音识别出的语种作答, 完全跟随音频。\n"
+            "  • 音频语言 + 翻译: 每段原文回答后紧跟一段译文, 交替显示。"
+        )
+
         self.agent_target_lang_edit = QLineEdit(a.target_lang, w)
         self.agent_target_lang_edit.setPlaceholderText("zh / en / ja / ...")
         self.agent_target_lang_edit.setMaximumWidth(160)
         self.agent_target_lang_edit.setToolTip(
-            "Agent 回复使用的语言。默认与译文目标语言相同，可单独设置。"
+            "仅在 ‘音频语言 + 翻译’ 模式下生效, 用作每段译文的目标语种。\n"
+            "‘仅音频语言’ 模式会忽略此项。"
+        )
+        # When the user is in source-only mode the translation language
+        # field is irrelevant; gray it out so they know it has no
+        # effect, but keep it editable so flipping back to bilingual
+        # restores their previous setting.
+        def _refresh_target_lang_enabled() -> None:
+            mode = self.agent_reply_mode_combo.currentData()
+            self.agent_target_lang_edit.setEnabled(
+                mode == "source_and_translation"
+            )
+
+        _refresh_target_lang_enabled()
+        self.agent_reply_mode_combo.currentIndexChanged.connect(
+            lambda _i: _refresh_target_lang_enabled()
         )
 
         self.agent_depth_combo = QComboBox(w)
@@ -843,7 +876,8 @@ class SettingsDialog(QDialog):
 
         behaviour_form.addRow(self.agent_enabled_check)
         behaviour_form.addRow("Agent 模式:", self.agent_mode_combo)
-        behaviour_form.addRow("回复目标语言:", self.agent_target_lang_edit)
+        behaviour_form.addRow("回复语言模式:", self.agent_reply_mode_combo)
+        behaviour_form.addRow("翻译语言 (仅双语模式):", self.agent_target_lang_edit)
         behaviour_form.addRow("回答详细程度:", self.agent_depth_combo)
         behaviour_form.addRow("最大输出 tokens:", self.agent_max_tokens_spin)
         behaviour_form.addRow("超时:", self.agent_timeout_spin)
@@ -1042,6 +1076,8 @@ class SettingsDialog(QDialog):
                 "model": ap.current_model() or cfg.agent.model,
                 "target_lang": self.agent_target_lang_edit.text().strip()
                 or cfg.agent.target_lang,
+                "reply_mode": self.agent_reply_mode_combo.currentData()
+                or cfg.agent.reply_mode,
                 "answer_depth": self.agent_depth_combo.currentData()
                 or cfg.agent.answer_depth,
                 "max_output_tokens": self.agent_max_tokens_spin.value(),

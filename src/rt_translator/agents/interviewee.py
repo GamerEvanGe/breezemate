@@ -17,7 +17,6 @@ controlled by ``AgentConfig.answer_depth`` (see ``base._DEPTH_DIRECTIVES``).
 from __future__ import annotations
 
 from .base import Agent
-from .supplement import _lang
 
 
 class IntervieweeAgent(Agent):
@@ -26,8 +25,8 @@ class IntervieweeAgent(Agent):
 
     def system_prompt(self) -> str:
         ctx = super().system_prompt()
-        tgt = _lang(self.cfg.target_lang)
         depth = self.depth_directive()
+        reply_lang = self.reply_language_directive()
         body = (
             "You are the 'interviewee coach' agent inside BreezeMate. The "
             "user is in a live interview right now; the transcript turns "
@@ -57,8 +56,7 @@ class IntervieweeAgent(Agent):
             "names, and include the kind of detail a competent "
             "interviewer would probe for if the answer were shorter.\n"
             "\n"
-            f"Language: write in {tgt} unless the question explicitly "
-            "asks for another language.\n"
+            f"{reply_lang}\n"
             "\n"
             "Voice: first person, professional but conversational. The "
             "user should be able to read it aloud verbatim. Avoid "

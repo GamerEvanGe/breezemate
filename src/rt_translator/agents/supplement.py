@@ -40,7 +40,18 @@ class SupplementAgent(Agent):
 
     def system_prompt(self) -> str:
         ctx = super().system_prompt()
+        # "Where the gloss lives" tracks the new reply-language mode:
+        #   * source                  -> monolingual gloss in the
+        #                                audio language (e.g. English
+        #                                explanation of an English term)
+        #   * source_and_translation  -> bilingual gloss: source-language
+        #                                gloss + same gloss translated
+        #                                into target_lang, separated by
+        #                                " — " on the same bullet so the
+        #                                bullet density stays manageable.
+        src = _lang(self._src_lang)
         tgt = _lang(self.cfg.target_lang)
+        bilingual = self.cfg.reply_mode == "source_and_translation"
         depth = self.cfg.answer_depth
         # Bullet ceiling scales with depth -- "deep" lets the agent
         # write a fuller study note, while "concise" keeps it to a
@@ -57,13 +68,35 @@ class SupplementAgent(Agent):
             max_bullets = 5
             vocab_quota = "at most THREE"
             length_hint = "under ~30 words; include collocations and register"
+        if bilingual:
+            # Bilingual bullets: each gloss is written as
+            #   "<source-language gloss> — <target-language gloss>"
+            # so the user can see both languages at a glance without
+            # doubling the bullet count.
+            gloss_lang_clause = (
+                f"in **{src}** (the audio language), followed by " 
+                f"' — ' and the same idea in **{tgt}**"
+            )
+            example_clause = f"a tiny example in {src} (no translation needed)"
+            output_lang_rule = (
+                f"Each bullet is bilingual: '<{src} text> — <{tgt} text>'. "
+                f"Do not split the bilingual halves onto separate bullets."
+            )
+        else:
+            gloss_lang_clause = f"in **{src}** (the audio language)"
+            example_clause = f"a tiny example in {src}"
+            output_lang_rule = (
+                f"All bullets are written in **{src}**. Do not include "
+                f"a {tgt} translation."
+            )
+
         body = (
             "You are the 'supplement' agent in a real-time subtitle app. "
             "For every transcript turn the user shows you, decide whether "
             "anything in the line would benefit a language learner who is "
             "already reading the literal translation. If yes, write a "
-            f"compact study note in {tgt}. If the sentence is plain "
-            "everyday speech with no notable vocabulary / idiom / "
+            f"compact study note {gloss_lang_clause}. If the sentence is "
+            "plain everyday speech with no notable vocabulary / idiom / "
             "cultural item, respond with EXACTLY the sentinel "
             "<<<SKIP>>> and nothing else.\n"
             "\n"
@@ -72,7 +105,7 @@ class SupplementAgent(Agent):
             "space). Allowed bullet kinds, in priority order:\n"
             f"  • Vocab / collocation: pick {vocab_quota} non-trivial "
             f"items from the line. Give: source term -- short gloss "
-            f"({length_hint}). Add a tiny example in {tgt}.\n"
+            f"({length_hint}). Add {example_clause}.\n"
             "  • Idiom / fixed expression: source idiom -- literal meaning "
             "AND idiomatic meaning. Skip if the translation already nailed "
             "the idiom obviously.\n"
@@ -94,7 +127,7 @@ class SupplementAgent(Agent):
             f"  * Never produce more than {max_bullets} bullets total.\n"
             "  * Never invent etymology / quotations you're not sure about.\n"
             "  * No markdown headers, no preamble, no closing remark.\n"
-            f"  * Output language: {tgt}.\n"
+            f"  * {output_lang_rule}\n"
         )
         return f"{ctx}\n{body}" if ctx else body
 

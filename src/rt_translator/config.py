@@ -156,6 +156,7 @@ class DisplayConfig(BaseModel):
 
 AgentMode = Literal["supplement", "interviewee"]
 AnswerDepth = Literal["concise", "standard", "deep"]
+ReplyLanguageMode = Literal["source", "source_and_translation"]
 
 
 class AgentConfig(BaseModel):
@@ -211,9 +212,34 @@ class AgentConfig(BaseModel):
     # for free providers (Ollama, glm-4-flash, ...) too.
     max_output_tokens: int = Field(default=1500, ge=64, le=8000)
     timeout_s: float = Field(default=45.0, gt=0)
-    # Output language for the agent reply. Mirrors translator.target_lang
-    # by default but can be overridden if the user wants, say, Chinese
-    # translations but English idiom unpacking.
+    # How the agent's reply is laid out across languages:
+    #
+    # * ``source`` -- the agent writes entirely in the AUDIO language
+    #   (i.e. whatever the speaker actually said, taken from
+    #   ``cfg.asr.language``). This is the new default: it matches
+    #   what most users expect when they ask an interviewee agent to
+    #   "answer the question I was just asked".
+    # * ``source_and_translation`` -- the agent writes in the audio
+    #   language, then for EVERY paragraph immediately follows it with
+    #   the same paragraph translated into ``target_lang``. Output
+    #   pattern (paragraph-level interleave, separated by blank lines):
+    #
+    #       <source paragraph 1>
+    #
+    #       <translation of paragraph 1>
+    #
+    #       <source paragraph 2>
+    #
+    #       <translation of paragraph 2>
+    #
+    # The translation is produced inside the same LLM call so it
+    # streams together with the original answer -- there is no second
+    # LLM hop.
+    reply_mode: ReplyLanguageMode = "source"
+    # Language used for the translation half when ``reply_mode ==
+    # 'source_and_translation'``. Ignored under ``source`` mode.
+    # Defaults to Chinese because that's the most common case for the
+    # current user base, but any ISO 639-1 code works.
     target_lang: str = "zh"
     # Hard limit on how much of the user-uploaded context we stuff into
     # every agent prompt. Keeps the token bill bounded and protects

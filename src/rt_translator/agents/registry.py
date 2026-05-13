@@ -31,6 +31,7 @@ def build_agent(
     cfg: AgentConfig,
     endpoint: ProviderEndpoint,
     context: Optional[ContextStore] = None,
+    src_lang: str = "en",
 ) -> Agent:
     """Instantiate the agent matching ``cfg.mode``.
 
@@ -38,7 +39,12 @@ def build_agent(
     never raise here so a corrupted YAML can't keep the user out of the
     UI; they'll just see the default agent until they pick a new one
     from the settings dialog.
+
+    ``src_lang`` is the audio language pulled from
+    ``cfg.asr.language`` at pipeline-build time. The agent stores it
+    so the reply-language directive knows which language the speaker
+    is using and can default to "answer in the same language".
     """
     cls = _AGENT_TYPES.get(cfg.mode, SupplementAgent)
     context_text = context.combined if context is not None else ""
-    return cls(cfg=cfg, endpoint=endpoint, context=context_text)
+    return cls(cfg=cfg, endpoint=endpoint, context=context_text, src_lang=src_lang)

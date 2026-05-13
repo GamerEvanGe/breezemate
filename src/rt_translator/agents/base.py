@@ -47,6 +47,33 @@ _REASONING_PREFIXES: tuple[str, ...] = (
 )
 
 
+# A small ISO 639-1 → "human-friendly" English name table used by the
+# reply-language directive. We deliberately don't import this from
+# ``supplement.py`` to avoid a circular import; the map is duplicated
+# on purpose, kept short, and identical in spirit.
+_LANG_FRIENDLY: dict[str, str] = {
+    "zh": "Simplified Chinese",
+    "zh-CN": "Simplified Chinese",
+    "zh-TW": "Traditional Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "ru": "Russian",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ar": "Arabic",
+    "hi": "Hindi",
+    "vi": "Vietnamese",
+}
+
+
+def _lang_friendly(code: str) -> str:
+    return _LANG_FRIENDLY.get(code, _LANG_FRIENDLY.get(code.split("-")[0], code))
+
+
 def _model_family_caps(model: str) -> tuple[bool, bool]:
     """Return ``(uses_completion_tokens, drops_temperature)`` for the
     given model id. Matches case-insensitively against the known
@@ -143,9 +170,15 @@ class Agent:
         cfg: AgentConfig,
         endpoint: ProviderEndpoint,
         context: str = "",
+        src_lang: str = "en",
     ) -> None:
         self.cfg = cfg
         self._context = context
+        # Captured at construction time from ``cfg.asr.language``. The
+        # audio language doesn't change mid-session, so we don't need
+        # to recompute the system prompt every turn. Stored separately
+        # because ``AgentConfig`` legitimately doesn't carry ASR state.
+        self._src_lang = src_lang or "en"
         api_key = endpoint.resolve_api_key() or "no-key-required"
         self._client = AsyncOpenAI(
             api_key=api_key,
@@ -194,6 +227,64 @@ class Agent:
         verbosity, not just the interviewee's.
         """
         return _DEPTH_DIRECTIVES.get(self.cfg.answer_depth, _DEPTH_DIRECTIVES["deep"])
+
+    def reply_language_directive(self) -> str:
+        """Return the system-prompt block that controls reply language.
+
+        Two modes (see ``AgentConfig.reply_mode``):
+
+        * ``source`` -- reply entirely in the audio language. This is
+          the default and the right behaviour for the vast majority of
+          situations: someone asks you a question in English, you
+          answer in English; someone asks in Chinese, you answer in
+          Chinese.
+
+        * ``source_and_translation`` -- write each paragraph TWICE,
+          once in the audio language and once in ``target_lang``, with
+          the translation immediately following each source paragraph
+          and a blank line between every paragraph. Used when the
+          listener wants to consume the reply in two languages at the
+          same time (e.g., a learner watching subtitles, or a bilingual
+          interview prep session).
+        """
+        src = _lang_friendly(self._src_lang)
+        if self.cfg.reply_mode == "source_and_translation":
+            tgt = _lang_friendly(self.cfg.target_lang)
+            return (
+                f"REPLY LANGUAGE: write the reply in **{src}** (the audio "
+                f"language) and, for every paragraph, immediately follow "
+                f"it with the same paragraph translated into **{tgt}**. "
+                f"Strict alternating layout, paragraphs separated by "
+                f"single blank lines:\n"
+                f"\n"
+                f"    <{src} paragraph 1>\n"
+                f"\n"
+                f"    <{tgt} translation of paragraph 1>\n"
+                f"\n"
+                f"    <{src} paragraph 2>\n"
+                f"\n"
+                f"    <{tgt} translation of paragraph 2>\n"
+                f"\n"
+                f"Rules:\n"
+                f"  * Do NOT group all {src} paragraphs together and "
+                f"then all {tgt} translations. The user reads them in "
+                f"order, top to bottom.\n"
+                f"  * The {tgt} translation must follow the *meaning* "
+                f"of the matching {src} paragraph, not the literal "
+                f"words. Idioms / technical terms get their natural "
+                f"{tgt} equivalent.\n"
+                f"  * Prefer shorter paragraphs over longer ones so the "
+                f"alternation stays readable; if you're running low on "
+                f"the token budget, end on a complete {src}+{tgt} pair "
+                f"rather than a half-translated stub."
+            )
+        return (
+            f"REPLY LANGUAGE: write the entire reply in **{src}** -- "
+            f"the language the speaker actually used. Do NOT switch to "
+            f"another language unless the speaker explicitly asks for "
+            f"a translation. Keep technical terms and proper nouns in "
+            f"their natural form in {src}."
+        )
 
     def user_message(self, turn: AgentInput) -> str:
         """Render one transcript turn as the user message for the LLM.

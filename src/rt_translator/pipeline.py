@@ -117,7 +117,12 @@ def _build_agent(cfg: AppConfig) -> Optional[Agent]:
         return None
     try:
         context = ContextStore(cfg.agent.context_files, cfg.agent.max_context_chars)
-        return build_agent(cfg.agent, cfg.agent_endpoint(), context=context)
+        return build_agent(
+            cfg.agent,
+            cfg.agent_endpoint(),
+            context=context,
+            src_lang=cfg.asr.language or "en",
+        )
     except Exception:
         log.exception("Failed to build agent; running without it")
         return None
