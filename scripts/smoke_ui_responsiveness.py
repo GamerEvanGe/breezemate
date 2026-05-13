@@ -1,6 +1,7 @@
-"""Smoke tests for the M3.2 responsiveness rework.
+"""Smoke tests for pipeline lifecycle responsiveness + the M3.3
+pause-gated agent firing.
 
-This script proves two end-user-visible promises without needing a
+This script proves three end-user-visible promises without needing a
 running pipeline:
 
 1. ``PipelineController.start()`` returns to the GUI thread quickly
@@ -14,12 +15,17 @@ running pipeline:
    "■ 停止" / "停止中…" / "▶ 开始" without the user ever seeing a dead
    button.
 
-3. The agent latency fix: ``_event_router`` now spawns the agent task
-   directly on ``TranscriptFinal`` instead of waiting on the
-   translator's ``TranslationFinal``. We exercise the router in
-   isolation against a fake translator that emits a TranslationFinal
-   a long time after the TranscriptFinal, and assert the agent has
-   already been kicked off long before the translation arrives.
+3. The M3.3 pause-gated agent: the previous design fired the agent on
+   every ``TranscriptFinal``, which produced noisy fragmentary
+   replies. The new design buffers transcripts and only flushes them
+   to the agent once the speaker has been silent for
+   ``cfg.agent.pause_threshold_s`` seconds. We exercise the router in
+   isolation and assert
+     (a) the agent does NOT fire while transcripts are still coming
+         in below the pause threshold,
+     (b) the agent DOES fire after the pause elapses, and
+     (c) the text it receives is the JOIN of all buffered
+         sentences, not just the most recent one.
 
 Pass criterion: prints "PASS: UI responsiveness smoke OK" and exits 0.
 """
@@ -125,124 +131,130 @@ def test_controller_start_is_non_blocking() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Agent spawns on TranscriptFinal, not on TranslationFinal
+# 2. Agent fires only after a silence pause, with buffered text
 # ---------------------------------------------------------------------------
 
 
-class _FakeTranslator:
-    """Translator that finalises *slowly* so we can prove the agent
-    isn't blocked on its TranslationFinal."""
-
-    aclose_called = False
-
-    def __init__(self, delay_s: float) -> None:
-        self._delay_s = delay_s
-
-    async def translate_stream(self, *, item_id, text, src_lang, tgt_lang, history):
-        from rt_translator.events import (
-            TranscriptFinal,
-            TranslationDelta,
-            TranslationFinal,
-        )
-
-        # Pretend the polishing finished quickly...
-        await asyncio.sleep(0.01)
-        yield TranscriptFinal(item_id=item_id, text=text + ".")
-        # ...but the translation is slow (network jitter).
-        await asyncio.sleep(self._delay_s)
-        yield TranslationDelta(item_id=item_id, text_so_far="(slow)")
-        yield TranslationFinal(item_id=item_id, text="(slow)")
-
-    async def aclose(self) -> None:
-        type(self).aclose_called = True
-
-
-class _FakeAgent:
-    """Records the wall-clock moment its run_stream is entered, so we
-    can prove it started long before TranslationFinal arrived."""
+class _RecordingAgent:
+    """Captures the wall-clock moment its run_stream is entered AND
+    the text it received, so we can assert both the pause timing AND
+    the buffered-text content in one test."""
 
     id = "interviewee"
-    spawned_at: float | None = None
 
     def __init__(self) -> None:
-        self.aclose_called = False
+        self.spawns: list[tuple[float, str]] = []  # (wall_clock, source_text)
 
     async def run_stream(self, turn):
         from rt_translator.events import AgentDelta, AgentFinal
 
-        _FakeAgent.spawned_at = time.perf_counter()
-        yield AgentDelta(item_id=turn.item_id, agent_id=self.id, text_so_far="...")
+        self.spawns.append((time.perf_counter(), turn.source_text))
+        yield AgentDelta(
+            item_id=turn.item_id, agent_id=self.id, text_so_far="..."
+        )
         await asyncio.sleep(0.01)
-        yield AgentFinal(item_id=turn.item_id, agent_id=self.id, text="agent reply")
+        yield AgentFinal(
+            item_id=turn.item_id, agent_id=self.id, text="agent reply"
+        )
 
     async def aclose(self) -> None:
-        self.aclose_called = True
+        pass
 
 
-def test_agent_spawns_before_translation_final() -> None:
+def test_agent_fires_only_after_pause() -> None:
+    """End-to-end timing assertion for the M3.3 pause-gated agent."""
     from rt_translator.config import AppConfig
-    from rt_translator.events import (
-        AgentFinal,
-        TranscriptFinal,
-        TranslationFinal,
-    )
+    from rt_translator.events import TranscriptFinal
     from rt_translator.pipeline import _event_router
 
     async def go() -> None:
         cfg = AppConfig()
-        cfg = cfg.model_copy(update={"mode": "translate"})
+        # Shrink the pause threshold so the test runs in a couple of
+        # seconds, not ten. Production default is 1.5 s.
+        cfg = cfg.model_copy(
+            update={
+                "mode": "asr_only",
+                "agent": cfg.agent.model_copy(
+                    update={"pause_threshold_s": 0.6}
+                ),
+            }
+        )
         in_q: asyncio.Queue = asyncio.Queue()
         out_q: asyncio.Queue = asyncio.Queue()
-        translator = _FakeTranslator(delay_s=0.5)
-        agent = _FakeAgent()
+        agent = _RecordingAgent()
 
-        # Drive the router for ~1.2s, then cancel it.
         router_task = asyncio.create_task(
-            _event_router(cfg, in_q, out_q, translator, None, agent)
+            _event_router(cfg, in_q, out_q, None, None, agent),
+            name="router",
         )
 
-        await in_q.put(TranscriptFinal(item_id="t1", text="how would you scale this"))
-        transcript_at = time.perf_counter()
+        # 1. Emit two TranscriptFinals fast (well under the 0.6s
+        #    threshold between them). Agent must NOT have fired by
+        #    the time the second one lands.
+        t0 = time.perf_counter()
+        await in_q.put(
+            TranscriptFinal(item_id="oai-1", text="Tell me about your background.")
+        )
+        await asyncio.sleep(0.2)
+        await in_q.put(
+            TranscriptFinal(
+                item_id="oai-2", text="And how would you design a rate limiter?"
+            )
+        )
+        await asyncio.sleep(0.1)
 
-        # Collect events for 1 second.
-        finals_by_type: dict[type, float] = {}
-        deadline = time.perf_counter() + 1.5
-        while time.perf_counter() < deadline:
-            try:
-                ev = await asyncio.wait_for(out_q.get(), timeout=0.05)
-            except asyncio.TimeoutError:
-                continue
-            if isinstance(ev, (AgentFinal, TranslationFinal)) and type(ev) not in finals_by_type:
-                finals_by_type[type(ev)] = time.perf_counter()
-            if AgentFinal in finals_by_type and TranslationFinal in finals_by_type:
-                break
+        elapsed_so_far = time.perf_counter() - t0
+        print(f"  after {elapsed_so_far:.2f}s of activity, spawns={len(agent.spawns)}")
+        assert (
+            len(agent.spawns) == 0
+        ), f"agent fired too early ({len(agent.spawns)} times during active speech)"
+
+        # 2. Now stop sending transcripts and wait past the pause
+        #    threshold. The watcher should flush within ~0.6s + its
+        #    150ms poll cycle.
+        await asyncio.sleep(cfg.agent.pause_threshold_s + 0.4)
+
+        assert (
+            len(agent.spawns) == 1
+        ), f"agent should have fired exactly once after the pause; got {len(agent.spawns)}"
+        spawn_at, spawn_text = agent.spawns[0]
+        delay_after_last_transcript = spawn_at - (t0 + 0.3)
+        print(
+            f"  agent fired {delay_after_last_transcript * 1000:.0f} ms after last transcript"
+        )
+
+        # 3. The spawn text must contain BOTH buffered sentences,
+        #    not just the latest one (the user wants the agent to
+        #    see the whole recent context to pick the question out).
+        assert "background" in spawn_text, spawn_text
+        assert "rate limiter" in spawn_text, spawn_text
+        print(f"  spawn_text contains both buffered sentences: {spawn_text!r}")
+
+        # 4. After flushing, the buffer should be empty: emit a new
+        #    transcript, wait past the threshold, agent fires AGAIN
+        #    -- and only on that new sentence, not on the old ones.
+        await in_q.put(
+            TranscriptFinal(item_id="oai-3", text="What about caching strategies?")
+        )
+        await asyncio.sleep(cfg.agent.pause_threshold_s + 0.4)
+        assert (
+            len(agent.spawns) == 2
+        ), f"second pause should re-arm the agent; spawns={len(agent.spawns)}"
+        assert "caching" in agent.spawns[1][1], agent.spawns[1][1]
+        # And critically, the second flush should NOT include text
+        # from the first flush -- the buffer was cleared.
+        assert (
+            "background" not in agent.spawns[1][1]
+        ), f"buffer leaked old sentences: {agent.spawns[1][1]!r}"
 
         router_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await router_task
-        except asyncio.CancelledError:
-            pass
 
-        # The agent must have been *kicked off* almost immediately,
-        # NOT after the slow translation delay.
-        assert _FakeAgent.spawned_at is not None, "agent was never spawned"
-        spawn_delay = _FakeAgent.spawned_at - transcript_at
-        print(f"  agent spawn delay after TranscriptFinal: {spawn_delay * 1000:.1f} ms")
-        # 50 ms is a generous bound -- in practice this is < 5 ms.
-        assert spawn_delay < 0.05, f"agent spawned {spawn_delay:.3f}s after transcript"
-
-        # And the agent must have FINISHED long before the translator
-        # got to its TranslationFinal (which is gated on a 0.5s sleep).
-        assert AgentFinal in finals_by_type, finals_by_type
-        assert TranslationFinal in finals_by_type, finals_by_type
-        gap = finals_by_type[TranslationFinal] - finals_by_type[AgentFinal]
-        print(f"  AgentFinal arrived {gap * 1000:.1f} ms before TranslationFinal")
-        assert gap > 0.3, (
-            f"agent should finish well before slow translation; gap={gap:.3f}s"
-        )
+    import contextlib
 
     asyncio.run(go())
-    print("  agent fires in parallel with translator: OK")
+    print("  pause-gated agent firing: OK")
 
 
 # ---------------------------------------------------------------------------
@@ -280,11 +292,47 @@ def test_stop_before_loop_boot() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _run_in_subprocess(test_name: str) -> int:
+    """Run one test in its own Python process.
+
+    The lifecycle test spins up real ``QApplication`` + an audio
+    capture worker thread (which on Windows holds ``soundcard``'s
+    WASAPI globals). Sharing that process with the asyncio-only
+    router test then crashes on final exit (0xC0000409 heap
+    corruption -- the same family of WASAPI race we hardened
+    against in M2.5). Cheapest reliable isolation is process
+    boundaries.
+    """
+    import subprocess
+
+    script = Path(__file__).resolve()
+    cmd = [sys.executable, str(script), "--single", test_name]
+    print(f"\n--- subprocess: {test_name} ---")
+    r = subprocess.run(cmd, cwd=str(REPO))
+    return r.returncode
+
+
 def main() -> int:
-    test_controller_start_is_non_blocking()
-    test_agent_spawns_before_translation_final()
-    test_stop_before_loop_boot()
-    print("PASS: UI responsiveness smoke OK")
+    if len(sys.argv) >= 3 and sys.argv[1] == "--single":
+        name = sys.argv[2]
+        if name == "controller":
+            test_controller_start_is_non_blocking()
+        elif name == "pause_agent":
+            test_agent_fires_only_after_pause()
+        elif name == "stop_before_boot":
+            test_stop_before_loop_boot()
+        else:
+            print(f"unknown test {name}", file=sys.stderr)
+            return 2
+        return 0
+
+    # Default entry point: dispatch each test into its own subprocess.
+    for sub in ("controller", "pause_agent", "stop_before_boot"):
+        rc = _run_in_subprocess(sub)
+        if rc != 0:
+            print(f"FAIL: subprocess {sub} returned {rc}", file=sys.stderr)
+            return rc
+    print("\nPASS: UI responsiveness smoke OK")
     return 0
 
 

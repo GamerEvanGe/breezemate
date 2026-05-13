@@ -864,6 +864,30 @@ class SettingsDialog(QDialog):
         self.agent_context_window_spin.setRange(0, 20)
         self.agent_context_window_spin.setValue(a.context_window)
 
+        # Pause-gated firing: how long to wait after the speaker stops
+        # talking before flushing the buffered transcripts to the
+        # agent, and how many recent sentences to keep in that buffer.
+        self.agent_pause_threshold_spin = QDoubleSpinBox(w)
+        self.agent_pause_threshold_spin.setRange(0.3, 10.0)
+        self.agent_pause_threshold_spin.setSingleStep(0.1)
+        self.agent_pause_threshold_spin.setDecimals(2)
+        self.agent_pause_threshold_spin.setSuffix(" s")
+        self.agent_pause_threshold_spin.setValue(a.pause_threshold_s)
+        self.agent_pause_threshold_spin.setToolTip(
+            "在多长的静音之后才把最近识别到的内容交给 Agent 回答。\n"
+            "调大: Agent 回答更完整, 但等待时间更长。\n"
+            "调小: Agent 反应更快, 但容易把半句话当成完整问题。"
+        )
+
+        self.agent_max_sentences_spin = QSpinBox(w)
+        self.agent_max_sentences_spin.setRange(1, 20)
+        self.agent_max_sentences_spin.setValue(a.max_sentences_per_turn)
+        self.agent_max_sentences_spin.setSuffix(" 句")
+        self.agent_max_sentences_spin.setToolTip(
+            "停顿触发时, 最多把最近多少句话拼成一段交给 Agent。\n"
+            "Agent 会从这段里识别出最近的一整个问题再作答。"
+        )
+
         self.agent_max_context_spin = QSpinBox(w)
         self.agent_max_context_spin.setRange(0, 200_000)
         self.agent_max_context_spin.setSingleStep(1000)
@@ -882,6 +906,8 @@ class SettingsDialog(QDialog):
         behaviour_form.addRow("最大输出 tokens:", self.agent_max_tokens_spin)
         behaviour_form.addRow("超时:", self.agent_timeout_spin)
         behaviour_form.addRow("Agent 上下文窗口 (轮):", self.agent_context_window_spin)
+        behaviour_form.addRow("触发停顿时长:", self.agent_pause_threshold_spin)
+        behaviour_form.addRow("回答前最多累计:", self.agent_max_sentences_spin)
         behaviour_form.addRow("参考文件字符上限:", self.agent_max_context_spin)
         outer.addLayout(behaviour_form)
 
@@ -1083,6 +1109,8 @@ class SettingsDialog(QDialog):
                 "max_output_tokens": self.agent_max_tokens_spin.value(),
                 "timeout_s": self.agent_timeout_spin.value(),
                 "context_window": self.agent_context_window_spin.value(),
+                "pause_threshold_s": self.agent_pause_threshold_spin.value(),
+                "max_sentences_per_turn": self.agent_max_sentences_spin.value(),
                 "max_context_chars": self.agent_max_context_spin.value(),
                 # context_files are managed from the main window so they
                 # survive whatever the user picks in this dialog.

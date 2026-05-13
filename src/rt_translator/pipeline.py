@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections import deque
 from typing import Optional, Protocol
 
@@ -186,16 +187,32 @@ async def _event_router(
     # finalised row. Only used in dual-engine mode.
     last_cloud_item_id: Optional[str] = None
 
+    # ----- M3.3 pause-gated agent firing -----
+    #
+    # Buffer of (item_id, text) tuples for the most recent
+    # TranscriptFinal events that haven't yet been handed to the
+    # agent. The watcher flushes the buffer to the agent once the
+    # speaker has been silent for ``cfg.agent.pause_threshold_s``
+    # seconds. ``last_transcript_at = 0.0`` means "nothing said yet";
+    # the watcher uses that to skip the very-first-iteration false
+    # positive (now - 0 is enormous, would otherwise fire instantly).
+    question_buffer: deque[tuple[str, str]] = deque(
+        maxlen=cfg.agent.max_sentences_per_turn
+    )
+    last_transcript_at: float = 0.0
+
     async def run_agent(item_id: str, polished_source: str, translation: str) -> None:
         """Stream an agent reply for one finished turn.
 
-        Spawned from the canonical ``TranscriptFinal`` handler so the
-        agent's LLM call runs *in parallel* with the translator's
-        polish + translate stream. ``translation`` is therefore
-        currently always ``""``; the parameter is kept on the public
-        signature so a future tweak (e.g. waiting briefly for the
-        polished version on slow ASR providers) doesn't require
-        plumbing changes downstream. Yields AgentDelta / AgentFinal /
+        Fired by the pause watcher once ``cfg.agent.pause_threshold_s``
+        has elapsed with no new ``TranscriptFinal`` events. The
+        ``polished_source`` here is the concatenation of every
+        TranscriptFinal that accumulated since the previous agent
+        fire; the agent's own classifier picks out the question (or
+        prints ``<<<SKIP>>>`` for chit-chat). ``translation`` is
+        currently always ``""``; kept on the signature in case a
+        future tweak wants to wait briefly for the polished version
+        on slow ASR providers. Yields AgentDelta / AgentFinal /
         AgentSkipped events onto the same out_q the UI is already
         draining.
         """
@@ -265,6 +282,62 @@ async def _event_router(
         finally:
             pending.pop(item_id, None)
 
+    async def _question_pause_watcher() -> None:
+        """Flush the question buffer to the agent once the speaker
+        has been silent long enough.
+
+        Polls every ~150 ms (cheap on the asyncio event loop) and
+        fires at most one agent task per pause. Three gating
+        conditions, in order of likelihood:
+
+        1. buffer empty (no transcripts seen yet, or already
+           flushed) -> nothing to do.
+        2. an agent task for the previous flush is still streaming
+           -> wait. This avoids two replies overlapping in the
+           agent overlay; the buffer keeps accumulating in the
+           meantime so the next flush includes everything spoken
+           since the last answer.
+        3. ``now - last_transcript_at < pause_threshold_s`` ->
+           speaker probably hasn't really stopped, keep waiting.
+
+        Once all three pass, we join the buffered sentences with a
+        single space (the agent's classifier handles questions in
+        unpunctuated speech fine, but a space between sentences
+        makes the boundaries visible), clear the buffer, and spawn
+        the agent on the joined text with the most recent item_id
+        so the AgentWindow row aligns with that source row.
+        """
+        threshold = cfg.agent.pause_threshold_s
+        while True:
+            await asyncio.sleep(0.15)
+            if agent is None or not question_buffer:
+                continue
+            if agent_pending:
+                # Agent still streaming the previous turn; defer.
+                continue
+            elapsed = time.monotonic() - last_transcript_at
+            if elapsed < threshold:
+                continue
+            # Pause detected -> flush.
+            sentences = [text for _, text in question_buffer]
+            combined = " ".join(s.strip() for s in sentences if s.strip())
+            anchor_item_id = question_buffer[-1][0]
+            question_buffer.clear()
+            log.debug(
+                "Agent pause-flush after %.2fs silence: %d sentence(s), %d chars -> %s",
+                elapsed,
+                len(sentences),
+                len(combined),
+                anchor_item_id,
+            )
+            spawn_agent(anchor_item_id, combined, "")
+
+    watcher_task: Optional[asyncio.Task] = None
+    if agent is not None:
+        watcher_task = asyncio.create_task(
+            _question_pause_watcher(), name="agent-pause-watcher"
+        )
+
     try:
         while True:
             ev = await in_q.get()
@@ -291,21 +364,10 @@ async def _event_router(
             await out_q.put(ev)
 
             if isinstance(ev, TranscriptFinal):
-                # Fan the canonical final out to BOTH the translator
-                # (if running) and the agent (if running) in parallel.
-                # Doing them sequentially -- the way it used to work,
-                # spawning the agent only on TranslationFinal -- meant
-                # the agent never started thinking until the slowest
-                # link in the chain (translator polish + translate)
-                # had finished streaming, easily adding 1-3 s of
-                # avoidable latency to every reply. Modern Realtime
-                # ASR (gpt-4o-mini-transcribe and friends) already
-                # ships punctuation in the raw final, which is enough
-                # for the agent's question-classifier; Vosk-only mode
-                # ships unpunctuated text but the agent prompts are
-                # robust against that.
-                if agent is not None:
-                    spawn_agent(ev.item_id, ev.text, "")
+                # Translator runs immediately so the subtitle overlay
+                # keeps showing the polished source + translation with
+                # zero added latency. Only the agent is gated on a
+                # silence pause -- see ``_question_pause_watcher``.
                 if cfg.mode == "translate" and translator is not None:
                     # Fire-and-forget; multiple translations can stream
                     # in parallel which keeps the sink responsive even
@@ -315,7 +377,18 @@ async def _event_router(
                         name=f"translate-{ev.item_id}",
                     )
                     pending[ev.item_id] = task
+                # Buffer the text and bump the silence timestamp.
+                # ``ev.text`` can be empty on rare cloud finals where
+                # the model committed an empty segment; skip those
+                # so we don't poison the buffer with junk.
+                if agent is not None and ev.text.strip():
+                    question_buffer.append((ev.item_id, ev.text))
+                    last_transcript_at = time.monotonic()
     except asyncio.CancelledError:
+        if watcher_task is not None:
+            watcher_task.cancel()
+            with contextlib.suppress(BaseException):
+                await watcher_task
         for t in pending.values():
             t.cancel()
         for t in pending.values():

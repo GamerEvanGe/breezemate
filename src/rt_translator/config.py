@@ -254,6 +254,27 @@ class AgentConfig(BaseModel):
     # are replayed as conversation history. Mirrors translator.context_window
     # but tracked independently so the agent can keep its own thread.
     context_window: int = Field(default=4, ge=0, le=20)
+    # ----- Pause-gated firing (M3.3) -----
+    #
+    # The earlier "fire as soon as TranscriptFinal arrives" design
+    # produced a noisy agent overlay full of partial answers because
+    # the interviewer's questions are often spread across multiple
+    # ASR segments. The new design buffers ``TranscriptFinal`` events
+    # and only fires the agent once the speaker has stopped talking
+    # for ``pause_threshold_s`` seconds, sending the accumulated
+    # recent transcripts as a single combined turn. The agent's own
+    # classify step then picks the question out of that block.
+    #
+    # ``pause_threshold_s`` is the silence window the router waits
+    # for after the most recent TranscriptFinal before flushing the
+    # buffer. 1.5 s tracks comfortable interview cadence; raise it
+    # for slower speakers, lower it for snappier turn-taking.
+    pause_threshold_s: float = Field(default=1.5, ge=0.3, le=10.0)
+    # Maximum number of recent ASR sentences to keep in the buffer.
+    # Anything older is dropped when a new sentence arrives. 6 covers
+    # most real questions (preamble + the question itself + a couple
+    # of clarifying tails) without making the agent prompt huge.
+    max_sentences_per_turn: int = Field(default=6, ge=1, le=20)
 
 
 class AgentWindowConfig(BaseModel):
