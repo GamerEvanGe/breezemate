@@ -36,13 +36,25 @@ import logging
 from typing import AsyncIterator
 
 from openai import AsyncOpenAI
-from openai import APIError, APITimeoutError
+from openai import APIError, APITimeoutError, BadRequestError
 
 from ...config import ProviderEndpoint, TranslatorConfig
 from ...events import TranscriptDelta, TranscriptFinal, TranslationDelta, TranslationFinal
 from ..base import TranslatorOutput
 
 log = logging.getLogger(__name__)
+
+
+# Mirror the table in ``agents.base``: reasoning-family models reject
+# the ``temperature`` parameter outright. We don't need the
+# max_tokens / max_completion_tokens split here because the polisher
+# does not send any token budget at all.
+_REASONING_PREFIXES: tuple[str, ...] = ("o1", "o3", "o4")
+
+
+def _drops_temperature(model: str) -> bool:
+    m = model.lower()
+    return any(m.startswith(p) for p in _REASONING_PREFIXES)
 
 
 _LANG_NAMES = {
@@ -207,12 +219,30 @@ class OpenAICompatibleTranslator:
         canonical polished text, and everything after the sentinel
         is forwarded as TranslationDelta events.
         """
-        stream = await self._client.chat.completions.create(
-            model=self.cfg.model,
-            messages=messages,
-            stream=True,
-            temperature=0.2,
-        )
+        kwargs: dict = {
+            "model": self.cfg.model,
+            "messages": messages,
+            "stream": True,
+        }
+        if not _drops_temperature(self.cfg.model):
+            kwargs["temperature"] = 0.2
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            # Reasoning-family models on some providers also reject
+            # ``temperature`` at 400-level even though the prefix
+            # heuristic didn't catch them. Retry once without it.
+            msg = str(e).lower()
+            if "temperature" in msg and "temperature" in kwargs:
+                log.info(
+                    "Translator: dropping temperature after 400 from %s (%s)",
+                    self.cfg.model,
+                    e,
+                )
+                kwargs.pop("temperature")
+                stream = await self._client.chat.completions.create(**kwargs)
+            else:
+                raise
 
         sentinel = _TRANSLATION_SENTINEL
         sentinel_len = len(sentinel)

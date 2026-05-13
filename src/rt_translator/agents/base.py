@@ -17,12 +17,46 @@ import logging
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
-from openai import APIError, APITimeoutError, AsyncOpenAI
+from openai import APIError, APITimeoutError, AsyncOpenAI, BadRequestError
 
 from ..config import AgentConfig, ProviderEndpoint
 from ..events import AgentDelta, AgentFinal, AgentSkipped
 
 log = logging.getLogger(__name__)
+
+
+# Model families that reject the legacy `max_tokens` parameter and only
+# accept the newer `max_completion_tokens` (introduced for the gpt-5 chat
+# family and the o1/o3/o4 reasoning families). Hitting one of these with
+# `max_tokens` raises HTTP 400 with code='unsupported_parameter'.
+_NEW_TOKEN_PARAM_PREFIXES: tuple[str, ...] = (
+    "gpt-5",
+    "o1",
+    "o3",
+    "o4",
+)
+
+
+# Reasoning models on top of that also reject `temperature`, `top_p`,
+# presence/frequency penalties, etc. The chat-flavour gpt-5* models
+# usually accept temperature, so we keep them separate.
+_REASONING_PREFIXES: tuple[str, ...] = (
+    "o1",
+    "o3",
+    "o4",
+)
+
+
+def _model_family_caps(model: str) -> tuple[bool, bool]:
+    """Return ``(uses_completion_tokens, drops_temperature)`` for the
+    given model id. Matches case-insensitively against the known
+    prefixes; non-OpenAI providers (DeepSeek, Groq, glm-*, Ollama
+    qwen-*, ...) fall through to the legacy shape, which is what
+    everyone else still accepts."""
+    m = model.lower()
+    use_completion = any(m.startswith(p) for p in _NEW_TOKEN_PARAM_PREFIXES)
+    drop_temp = any(m.startswith(p) for p in _REASONING_PREFIXES)
+    return use_completion, drop_temp
 
 
 _SKIP_SENTINEL = "<<<SKIP>>>"
@@ -121,6 +155,11 @@ class Agent:
         )
         # (source, translation, agent_reply) triples for in-prompt history.
         self._history: list[tuple[str, str, str]] = []
+        # Cached adaptation of (max_tokens/max_completion_tokens, temperature)
+        # learned from a prior 400 response. Populated lazily on first
+        # successful call so subsequent turns avoid the retry round-trip.
+        # Keys are the kwargs we actually send to chat.completions.create.
+        self._param_overrides: Optional[dict] = None
 
     # ----- prompt builders, overridden by subclasses --------------------
 
@@ -193,13 +232,7 @@ class Agent:
         accumulated = ""
         emitted_any = False
         try:
-            stream = await self._client.chat.completions.create(
-                model=self.cfg.model,
-                messages=messages,
-                stream=True,
-                temperature=0.4,
-                max_tokens=self.cfg.max_output_tokens,
-            )
+            stream = await self._open_stream(messages)
         except (APITimeoutError, asyncio.TimeoutError) as e:
             log.warning("Agent[%s] timeout opening stream: %s", self.id, e)
             yield AgentFinal(item_id=turn.item_id, agent_id=self.id, text="[Agent 调用超时]")
@@ -267,6 +300,116 @@ class Agent:
             )
         self._history.append((turn.source_text, turn.translation, final_text))
         yield AgentFinal(item_id=turn.item_id, agent_id=self.id, text=final_text)
+
+    # ----- model-family adaptation -------------------------------------
+
+    def _initial_kwargs(self) -> dict:
+        """Build the kwargs for ``chat.completions.create``, picking the
+        right token-budget parameter name and optionally dropping
+        ``temperature`` for reasoning models.
+
+        Once we have observed a successful adaptation on this instance,
+        we reuse it directly (``self._param_overrides``) so subsequent
+        turns don't have to fail-and-retry.
+        """
+        kwargs: dict = {
+            "model": self.cfg.model,
+            "stream": True,
+        }
+        if self._param_overrides is not None:
+            kwargs.update(self._param_overrides)
+            return kwargs
+
+        use_completion, drop_temp = _model_family_caps(self.cfg.model)
+        if use_completion:
+            kwargs["max_completion_tokens"] = self.cfg.max_output_tokens
+        else:
+            kwargs["max_tokens"] = self.cfg.max_output_tokens
+        if not drop_temp:
+            kwargs["temperature"] = 0.4
+        return kwargs
+
+    @staticmethod
+    def _adapt_kwargs_for_error(kwargs: dict, err_text: str) -> bool:
+        """Mutate ``kwargs`` in place so the next ``create`` call has a
+        chance of succeeding. Returns True if anything actually changed.
+
+        Handles the two common shapes we see from OpenAI / OpenAI-
+        compatible providers:
+
+        * ``Unsupported parameter: 'max_tokens'`` -- newer model, rename
+          to ``max_completion_tokens``.
+        * ``Unsupported parameter: 'max_completion_tokens'`` -- legacy
+          model on a strict provider, rename back to ``max_tokens``.
+        * ``Unsupported value: 'temperature'`` / ``temperature ... not
+          supported`` -- reasoning model, drop the temperature entirely.
+        """
+        msg = err_text.lower()
+        changed = False
+        rename_to_completion = (
+            "max_tokens" in msg
+            and "max_completion_tokens" in msg
+            and "max_tokens" in kwargs
+        )
+        rename_to_legacy = (
+            "max_completion_tokens" in msg
+            and "max_tokens" in msg
+            and "max_completion_tokens" in kwargs
+            and "max_tokens" not in kwargs
+        )
+        if rename_to_completion:
+            val = kwargs.pop("max_tokens")
+            kwargs["max_completion_tokens"] = val
+            changed = True
+        elif rename_to_legacy:
+            val = kwargs.pop("max_completion_tokens")
+            kwargs["max_tokens"] = val
+            changed = True
+        if "temperature" in msg and (
+            "unsupported" in msg or "not supported" in msg or "only the default" in msg
+        ):
+            if "temperature" in kwargs:
+                kwargs.pop("temperature")
+                changed = True
+        return changed
+
+    async def _open_stream(self, messages: list[dict]):
+        """Open the streaming chat-completions request.
+
+        First attempt uses the kwargs inferred from the model name. If
+        the provider rejects an individual parameter (HTTP 400 with
+        ``unsupported_parameter`` or similar wording), we adapt the
+        kwargs once and retry. The successful shape is cached on the
+        instance so we don't pay the round-trip again next turn.
+        """
+        kwargs = self._initial_kwargs()
+        last_err: Optional[BadRequestError] = None
+        for attempt in range(3):
+            try:
+                stream = await self._client.chat.completions.create(
+                    messages=messages, **kwargs
+                )
+            except BadRequestError as e:
+                last_err = e
+                if not self._adapt_kwargs_for_error(kwargs, str(e)):
+                    raise
+                log.info(
+                    "Agent[%s] adapted kwargs after 400 (attempt %d): keys=%s",
+                    self.id,
+                    attempt + 1,
+                    sorted(k for k in kwargs if k != "model" and k != "stream"),
+                )
+                continue
+            # Success: remember the shape so future turns skip the retry.
+            self._param_overrides = {
+                k: v for k, v in kwargs.items() if k not in ("model", "stream")
+            }
+            return stream
+        # We exhausted retries without succeeding; surface the last error
+        # to the caller's APIError handler.
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("Agent._open_stream: exhausted retries with no error captured")
 
     async def aclose(self) -> None:
         try:

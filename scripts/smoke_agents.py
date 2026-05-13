@@ -220,6 +220,168 @@ def test_agent_config_defaults() -> None:
     print("  agent config defaults: OK")
 
 
+def test_model_family_caps() -> None:
+    """The model-family helper must classify gpt-5*/o*-family models as
+    "use max_completion_tokens", and reasoning models as "no
+    temperature". Legacy chat models stay on the old shape so non-OpenAI
+    providers (DeepSeek, glm, Ollama, ...) keep working."""
+    from rt_translator.agents.base import _model_family_caps
+
+    cases = {
+        "gpt-4o-mini": (False, False),
+        "gpt-4o": (False, False),
+        "gpt-4.1-mini": (False, False),
+        "gpt-5-mini": (True, False),
+        "gpt-5": (True, False),
+        "gpt-5.5": (True, False),
+        "o1-mini": (True, True),
+        "o3-mini": (True, True),
+        "o3": (True, True),
+        "o4-mini": (True, True),
+        "deepseek-chat": (False, False),
+        "glm-4-flash": (False, False),
+        "Qwen/Qwen2.5-7B-Instruct": (False, False),
+    }
+    for model, expected in cases.items():
+        got = _model_family_caps(model)
+        assert got == expected, f"{model}: expected {expected}, got {got}"
+    print("  model family caps: OK")
+
+
+# Imitates OpenAI's 400 the first time, succeeds on retry.
+class _Adaptive400Completions:
+    def __init__(self, expected_param: str) -> None:
+        self._expected_param = expected_param
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        if "messages" not in kwargs:
+            raise AssertionError("messages missing")
+        if self._expected_param not in kwargs:
+            # Simulate OpenAI's exact wording so the adapter's
+            # heuristic has to actually parse it.
+            from openai import BadRequestError
+
+            # The OpenAI SDK builds BadRequestError from an httpx
+            # Response in production, but the constructor also accepts
+            # message=... + body=... shapes. Build the bare-message
+            # variant since our adapter only inspects str(e).
+            other = "max_tokens" if self._expected_param == "max_completion_tokens" else "max_completion_tokens"
+            raise BadRequestError(
+                message=(
+                    f"Error code: 400 - Unsupported parameter: "
+                    f"'{other}' is not supported with this model. "
+                    f"Use '{self._expected_param}' instead."
+                ),
+                response=None,  # type: ignore[arg-type]
+                body=None,
+            )
+        return _FakeStream(["• ", "ok"])
+
+
+class _Adaptive400Chat:
+    def __init__(self, expected_param: str) -> None:
+        self.completions = _Adaptive400Completions(expected_param)
+
+
+class _Adaptive400OpenAI:
+    def __init__(self, expected_param: str) -> None:
+        self.chat = _Adaptive400Chat(expected_param)
+
+    async def close(self) -> None:
+        pass
+
+
+async def _run_adaptive_with_model(model: str, expected_param: str):
+    from rt_translator.agents.supplement import SupplementAgent
+    from rt_translator.agents.base import AgentInput
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    cfg = AgentConfig(enabled=True, provider="openai", model=model)
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+    agent = SupplementAgent(cfg, endpoint, context="")
+    fake = _Adaptive400OpenAI(expected_param)
+    agent._client = fake  # type: ignore[assignment]
+    turn = AgentInput(item_id="x", source_text="hi", translation="你好", src_lang="en")
+    events: list = []
+    async for ev in agent.run_stream(turn):
+        events.append(ev)
+    return agent, fake.chat.completions.calls, events
+
+
+def test_max_tokens_rename_for_gpt5() -> None:
+    """When the model is gpt-5* and the first attempt still happens to
+    send ``max_tokens`` (e.g. cached overrides got cleared), the
+    adapter must rename it to ``max_completion_tokens`` and retry
+    without surfacing the error to the user."""
+    from rt_translator.events import AgentFinal, AgentDelta
+
+    # gpt-5* models should pick max_completion_tokens up front and never
+    # hit the 400 at all.
+    agent, calls, events = asyncio.run(
+        _run_adaptive_with_model("gpt-5.5", expected_param="max_completion_tokens")
+    )
+    assert len(calls) == 1, f"expected 1 call, got {len(calls)}: {calls}"
+    assert "max_completion_tokens" in calls[0], calls[0].keys()
+    assert "max_tokens" not in calls[0]
+    assert "temperature" in calls[0], "gpt-5 chat models accept temperature"
+    finals = [e for e in events if isinstance(e, AgentFinal)]
+    assert finals and "ok" in finals[-1].text, events
+    assert agent._param_overrides is not None
+    print("  gpt-5 picks max_completion_tokens up front: OK")
+
+
+def test_temperature_dropped_for_o3() -> None:
+    """o3 reasoning models reject temperature AND max_tokens. The
+    initial kwargs heuristic must skip temperature; if a provider
+    surprises us with a different 400, the adapter should still
+    recover."""
+    from rt_translator.agents.base import Agent, _model_family_caps
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    cfg = AgentConfig(enabled=True, provider="openai", model="o3-mini")
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+    agent = Agent(cfg, endpoint, context="")  # base class is fine here
+
+    kwargs = agent._initial_kwargs()
+    assert "temperature" not in kwargs, kwargs
+    assert "max_completion_tokens" in kwargs, kwargs
+    assert "max_tokens" not in kwargs, kwargs
+
+    # adapter must still drop temperature if a provider complains
+    kwargs2 = {
+        "model": "o3-mini",
+        "stream": True,
+        "max_completion_tokens": 500,
+        "temperature": 0.4,
+    }
+    changed = Agent._adapt_kwargs_for_error(
+        kwargs2,
+        "Error code: 400 - Unsupported parameter: 'temperature' is not supported with this model.",
+    )
+    assert changed
+    assert "temperature" not in kwargs2
+    print("  o3 reasoning model adaptation: OK")
+
+
+def test_legacy_model_unchanged() -> None:
+    """Non-OpenAI / legacy models must keep using `max_tokens` and
+    `temperature`. Otherwise we'd break free providers like glm-4-flash,
+    Ollama, DeepSeek, etc."""
+    from rt_translator.agents.base import Agent
+    from rt_translator.config import AgentConfig, ProviderEndpoint
+
+    cfg = AgentConfig(enabled=True, provider="openai", model="gpt-4o-mini")
+    endpoint = ProviderEndpoint(base_url="http://localhost", auth_required=False)
+    agent = Agent(cfg, endpoint, context="")
+    kwargs = agent._initial_kwargs()
+    assert kwargs.get("max_tokens") == cfg.max_output_tokens, kwargs
+    assert kwargs.get("temperature") == 0.4, kwargs
+    assert "max_completion_tokens" not in kwargs, kwargs
+    print("  legacy model kwargs unchanged: OK")
+
+
 # -------------------------- 3. agent window UI --------------------------------
 
 
@@ -264,6 +426,10 @@ def main() -> int:
     test_agent_streaming_skipped()
     test_interviewee_depth_directive()
     test_agent_config_defaults()
+    test_model_family_caps()
+    test_max_tokens_rename_for_gpt5()
+    test_temperature_dropped_for_o3()
+    test_legacy_model_unchanged()
     test_agent_window()
     print("PASS: agents smoke OK")
     return 0
