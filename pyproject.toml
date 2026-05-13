@@ -58,6 +58,7 @@ include = [
 
 [dependency-groups]
 dev = [
+    "pefile>=2024.8.26",
     "pillow>=12.0",
     "pyinstaller>=6.20",
 ]

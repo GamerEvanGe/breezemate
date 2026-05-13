@@ -1,0 +1,38 @@
+VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=(1, 0, 3, 0),
+        prodvers=(1, 0, 3, 0),
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    "040904B0",
+                    [
+                        StringStruct("CompanyName", "BreezeMate"),
+                        StringStruct(
+                            "FileDescription",
+                            "BreezeMate \u5fae\u4f34 Setup",
+                        ),
+                        StringStruct("FileVersion", "1.0.3.0"),
+                        StringStruct("InternalName", "BreezeMateSetup"),
+                        StringStruct(
+                            "LegalCopyright",
+                            "\u00a9 BreezeMate. All rights reserved.",
+                        ),
+                        StringStruct("OriginalFilename", "BreezeMateSetup.exe"),
+                        StringStruct("ProductName", "BreezeMate \u5fae\u4f34"),
+                        StringStruct("ProductVersion", "1.0.3.0"),
+                    ],
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+    ],
+)

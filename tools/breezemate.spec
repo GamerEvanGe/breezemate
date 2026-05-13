@@ -110,6 +110,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ROOT / "assets" / "breezemate.ico"),
+    # VERSIONINFO resource. Windows Explorer caches RT_ICON thumbnails
+    # keyed on (path, size, version), so bumping the version inside
+    # version_info.txt is the most reliable way to make a brand-new
+    # icon show up on machines that have run an older BreezeMate.exe
+    # before. As a bonus, right-click -> Properties -> Details now
+    # displays "BreezeMate 微伴" / version / copyright instead of
+    # empty fields.
+    version=str(ROOT / "tools" / "version_info.txt"),
 )
 
 coll = COLLECT(
